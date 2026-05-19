@@ -458,17 +458,17 @@ class Qwen3_5Model(nn.Module):
             'total': sum(p.numel() for p in self.parameters()),
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, use_muon=True):
         # Based on nanochat optimization setup
         model_dim = self.config.emb_dim
         ddp, rank, local_rank, world_size = get_dist_info()
-        
+
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        
+
         # All other params (transformer blocks and final norm)
         other_params = list(self.transformer.h.parameters()) + list(self.final_norm.parameters())
-        
+
         matrix_params = [p for p in other_params if p.ndim >= 2]
         scalar_params = [p for p in other_params if p.ndim < 2]
 
@@ -479,11 +479,17 @@ class Qwen3_5Model(nn.Module):
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=scalar_params, lr=scalar_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        if use_muon:
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                ))
+        else:
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                kind='adamw', params=matrix_params, lr=matrix_lr,
+                betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay,
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW

@@ -56,7 +56,8 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=131072, help="total batch size in tokens (manual)")
 parser.add_argument("--embedding-lr", type=float, default=0.03, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.003, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.10, help="weight decay for Muon matrix params")
+parser.add_argument("--weight-decay", type=float, default=0.10, help="weight decay for matrix params")
+parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "adamw"], help="optimizer for matrix params: muon (default) or adamw (for debugging)")
 parser.add_argument("--matrix-lr", type=float, default=0.005, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.05, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=100, help="number of steps for LR warmup")
@@ -286,14 +287,14 @@ def get_weight_decay(it):
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    use_muon=(args.optimizer == "muon"),
 )
+print0(f"Optimizer: {args.optimizer} for matrix params")
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -366,18 +367,18 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-        model.eval()
-        with disable_fp8(orig_model):
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
-        model.train()
+    # if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    #     model.eval()
+    #     with disable_fp8(orig_model):
+    #         results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+    #     print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+    #     wandb_run.log({
+    #         "step": step,
+    #         "total_training_flops": flops_so_far,
+    #         "core_metric": results["core_metric"],
+    #         "centered_results": results["centered_results"],
+    #     })
+    #     model.train()
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
@@ -454,6 +455,7 @@ while True:
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:
         scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
         # the found_inf flag (MAX = if any rank found inf, all ranks skip).
@@ -463,6 +465,7 @@ while True:
         scaler.step(optimizer)
         scaler.update()
     else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
