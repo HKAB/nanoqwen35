@@ -18,7 +18,7 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(dynamic=True, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -88,7 +88,7 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(dynamic=True, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
@@ -248,9 +248,15 @@ class MuonAdamW(torch.optim.Optimizer):
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         momentum_buffer = state["momentum_buffer"]
 
-        # Second momentum buffer is factored, either per-row or per-column
+        # Second momentum buffer is factored along the last two dims (per-row or per-column).
+        # For params with leading dims beyond the last two, those are preserved in the buffer shape
+        # so that the buffer can broadcast with v_mean which has shape (num_params, *shape).
         if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+            leading = shape[:-2]
+            if shape[-2] >= shape[-1]:
+                state_shape = (num_params, *leading, shape[-2], 1)
+            else:
+                state_shape = (num_params, *leading, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
@@ -466,7 +472,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+            leading = shape[:-2]
+            if shape[-2] >= shape[-1]:
+                state_shape = (chunk_size, *leading, shape[-2], 1)
+            else:
+                state_shape = (chunk_size, *leading, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
