@@ -214,7 +214,7 @@ class Engine:
         output_start = get_special("<|output_start|>")
         output_end = get_special("<|output_end|>")
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
-        bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
+        pad_token_id = self.tokenizer.token_to_id("<|endoftext|>") # if sampled, ends row
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
@@ -271,7 +271,7 @@ class Engine:
                 # Update the state of this row to include the next token
                 state.current_tokens.append(next_token)
                 # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
+                if next_token == assistant_end or next_token == pad_token_id:
                     state.completed = True
                 # Handle tool logic
                 if next_token == python_start:
@@ -303,17 +303,17 @@ class Engine:
         """
         Non-streaming batch generation that just returns the final token sequences.
         Returns a list of token sequences (list of lists of ints).
-        Terminal tokens (assistant_end, bos) are not included in the results.
+        Terminal tokens (assistant_end, pad) are not included in the results.
         """
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
-        bos = self.tokenizer.get_bos_token_id()
+        pad_token_id = self.tokenizer.token_to_id("<|endoftext|>")
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
         for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
-                    if token == assistant_end or token == bos:
+                    if token == assistant_end or token == pad_token_id:
                         completed[i] = True
                     else:
                         results[i].append(token)
@@ -335,11 +335,10 @@ if __name__ == "__main__":
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     # load the model and tokenizer
     model, tokenizer, meta = load_pretrained_hf("/home/truongnp5/Desktop/qwen35/Qwen3.5-0.8B", device, phase="eval")
-    bos_token_id = tokenizer.get_bos_token_id()
     # common hyperparameters
     kwargs = dict(max_tokens=64, temperature=0.0)
-    # set the starting prompt
-    prompt_tokens = tokenizer.encode("The chemical formula of water is", prepend=bos_token_id)
+    # set the starting prompt (Qwen3.5 has no BOS token, encode without prepend)
+    prompt_tokens = tokenizer.encode("The chemical formula of water is")
     # generate the reference sequence using the model.generate() function
     generated_tokens = []
     torch.cuda.synchronize()

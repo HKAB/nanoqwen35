@@ -94,8 +94,8 @@ _MC_QUESTIONS = [
 _LABELS = ["A", "B", "C", "D"]
 
 
-def format_mc_prompt(item):
-    """Format a multiple-choice item as a conversation dict."""
+def _build_conversation(item):
+    """Build a conversation dict with the letters/answer fields needed by the eval loops."""
     choices_text = "\n".join(f"{_LABELS[i]}. {c}" for i, c in enumerate(item["choices"]))
     content = (
         f"{item['question']}\n\n{choices_text}\n\n"
@@ -105,33 +105,46 @@ def format_mc_prompt(item):
         "messages": [
             {"role": "user", "content": content},
             {"role": "assistant", "content": _LABELS[item["answer"]]},
-        ]
+        ],
+        "letters": _LABELS[:len(item["choices"])],
+        "answer": _LABELS[item["answer"]],
     }
+
+
+class SampleMC:
+    """
+    Sample multiple-choice task compatible with run_categorical_eval in chat_eval.py.
+    eval_type = 'categorical': evaluation is done via logit comparison over the answer letters.
+    """
+    eval_type = "categorical"
+
+    def __len__(self):
+        return len(_MC_QUESTIONS)
+
+    def __getitem__(self, idx):
+        return _build_conversation(_MC_QUESTIONS[idx])
+
+    def evaluate(self, conversation, predicted_letter):
+        return predicted_letter == conversation["answer"]
 
 
 def run_sample_mc_eval(model, tokenizer, engine, max_problems=None):
     """
-    Evaluate model on sample multiple-choice questions.
-    Uses greedy generation — checks if the first meaningful token matches the correct label.
+    Convenience wrapper used from chat_sft.py — evaluates with greedy generation.
     Returns accuracy (float 0-1).
     """
-    import torch
-
     questions = _MC_QUESTIONS
     if max_problems is not None:
         questions = questions[:max_problems]
 
-    label_ids = {label: tokenizer.encode(label)[0] for label in _LABELS}
-
     correct = 0
     for item in questions:
-        prompt_ids = tokenizer.render_for_completion(format_mc_prompt(item))
-        tokens = torch.tensor([prompt_ids], dtype=torch.long)
-        sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=4, temperature=0)
+        conv = _build_conversation(item)
+        prompt_ids = tokenizer.render_for_completion(conv)
+        sample, _ = engine.generate_batch(prompt_ids, num_samples=1, max_tokens=4, temperature=0)
         generated = tokenizer.decode(sample[0]).strip()
-        # Take the first letter that is a valid label
         predicted = next((c for c in generated.upper() if c in _LABELS), None)
-        if predicted == _LABELS[item["answer"]]:
+        if predicted == conv["answer"]:
             correct += 1
 
     return correct / len(questions) if questions else 0.0

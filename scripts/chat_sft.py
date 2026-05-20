@@ -177,7 +177,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     dataset_size = len(dataset)
     assert dataset_size > 0
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
-    bos_token = tokenizer.get_bos_token_id()
+    pad_token_id = tokenizer.token_to_id("<|endoftext|>")
 
     # Conversation buffer: list of (token_ids, loss_mask) tuples
     conv_buffer = []
@@ -232,7 +232,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     # No conversation fits - pad the remainder instead of cropping
                     # This ensures we never discard any tokens
                     content_len = len(row)
-                    row.extend([bos_token] * remaining)  # Pad with BOS tokens
+                    row.extend([pad_token_id] * remaining)  # Pad with PAD tokens
                     mask_row.extend([0] * remaining)
                     padded = True
                     break  # Row is now full (with padding)

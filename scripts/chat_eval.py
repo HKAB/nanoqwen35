@@ -9,7 +9,6 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
 import argparse
-from functools import partial
 import torch
 import torch.distributed as dist
 
@@ -17,11 +16,7 @@ from nanoqwen35.common import compute_init, compute_cleanup, get_dist_info, prin
 from nanoqwen35.checkpoint_manager import load_model
 from nanoqwen35.engine import Engine
 
-from tasks.humaneval import HumanEval
-from tasks.mmlu import MMLU
-from tasks.arc import ARC
-from tasks.gsm8k import GSM8K
-from tasks.spellingbee import SpellingBee
+from tasks.sample_eval import SampleMC
 
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
@@ -89,7 +84,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
-    bos = tokenizer.get_bos_token_id() # use BOS as pad token is ok, these positions are ignored
+    pad_token_id = tokenizer.token_to_id("<|endoftext|>")
 
     # We'll process batches of independent problems at a time because there is no sampling needed
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
@@ -104,10 +99,10 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 
         # Prepare the batch of problems. They might all be of different length, so we pad/collate them.
         conversations = [task_object[ii] for ii in range(i0, i1)]
-        prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations] # TODO: remake the way this works
+        prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations]
         max_length = max(len(ids) for ids in prompt_ids)
         answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
-        padded_prompt_ids = [ids + [bos] * (max_length - len(ids)) for ids in prompt_ids]
+        padded_prompt_ids = [ids + [pad_token_id] * (max_length - len(ids)) for ids in prompt_ids]
         prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
 
         # Get the logits for the whole batch of conversations in parallel (efficiency win here)
@@ -157,17 +152,12 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
                    max_problems=None):
-    # Create the evaluation object
-    task_module = {
-        'HumanEval': HumanEval,
-        'MMLU': partial(MMLU, subset="all", split="test"),
-        'ARC-Easy': partial(ARC, subset="ARC-Easy", split="test"),
-        'ARC-Challenge': partial(ARC, subset="ARC-Challenge", split="test"),
-        'GSM8K': partial(GSM8K, subset="main", split="test"),
-        'SpellingBee': partial(SpellingBee, size=256, split="test"),
-    }[task_name]
-    task_object = task_module()
-    # Run the evaluation
+    task_registry = {
+        'SampleMC': SampleMC,
+    }
+    if task_name not in task_registry:
+        raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_registry)}")
+    task_object = task_registry[task_name]()
     if task_object.eval_type == 'generative':
         acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
     elif task_object.eval_type == 'categorical':
@@ -201,14 +191,9 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
-    all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
+    all_tasks = ['SampleMC']
     baseline_accuracies = {
-        'ARC-Easy': 0.25, # multiple choice 1 of 4 => 25%
-        'ARC-Challenge': 0.25, # multiple choice 1 of 4 => 25%
-        'MMLU': 0.25, # multiple choice 1 of 4 => 25%
-        'GSM8K': 0.0, # open-ended => 0%
-        'HumanEval': 0.0, # open-ended => 0%
-        'SpellingBee': 0.0, # open-ended => 0%
+        'SampleMC': 0.25, # multiple choice 1 of 4 => 25%
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 
