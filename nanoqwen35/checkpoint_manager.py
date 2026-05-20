@@ -235,6 +235,32 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     tokenizer = HuggingFaceTokenizer.from_directory(pretrained_dir)
     return model, tokenizer, {"model_config": model_config_kwargs}
 
+def load_model(source, *args, **kwargs):
+    model_dir = {
+        "base": "base_checkpoints",
+        "sft": "chatsft_checkpoints",
+        "rl": "chatrl_checkpoints",
+    }[source]
+    base_dir = get_base_dir()
+    checkpoints_dir = os.path.join(base_dir, model_dir)
+    return load_model_from_dir(checkpoints_dir, *args, **kwargs)
+
+
+def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None):
+    if model_tag is None:
+        # guess the model tag by defaulting to the largest model
+        model_tag = find_largest_model(checkpoints_dir)
+        log0(f"No model tag provided, guessing model tag: {model_tag}")
+    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
+    if step is None:
+        # guess the step by defaulting to the last step
+        step = find_last_step(checkpoint_dir)
+    assert step is not None, f"No checkpoints found in {checkpoint_dir}"
+    # build the model
+    log0(f"Loading model from {checkpoint_dir} with step {step}")
+    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
+    return model, tokenizer, meta_data
+
 def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     """Load just the optimizer shard for a given rank, without re-loading the model."""
     model_dir = {
