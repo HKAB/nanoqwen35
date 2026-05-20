@@ -213,7 +213,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
 
     # Stack up all the sequences into a batch
-    pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok
+    pad_token_id = tokenizer.token_to_id("<|endoftext|>")
     input_ids = stack_sequences(tokens, pad_token_id)
     input_ids = input_ids.to(device)
 

@@ -13,6 +13,8 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# Persistent torch.compile cache — avoids recompiling on every restart
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "nanoqwen35", "inductor"))
 import gc
 import json
 import time
@@ -24,6 +26,8 @@ from contextlib import contextmanager
 import wandb
 import torch
 import torch.distributed as dist
+import torch._inductor.config as inductor_config
+inductor_config.fx_graph_cache = True  # persist compiled FX graphs to disk
 
 from nanoqwen35.qwen import Qwen3_5Model, Qwen3_5ModelConfig, Linear
 from nanoqwen35.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -73,6 +77,12 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument(
+    "--pretrained-model-path",
+    type=str,
+    default="./Qwen3.5-0.8B",
+    help="path or HF repo id of pretrained model/tokenizer",
+)
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -112,7 +122,7 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
+tokenizer = get_tokenizer(pretrained_dir=args.pretrained_model_path)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
@@ -120,7 +130,8 @@ print0(f"Vocab size: {vocab_size:,}")
 # Initialize the Model
 
 # Load the pretrained model
-model, tokenizer, meta_data_loaded = load_pretrained_hf("/home/truongnp5/Desktop/qwen35/Qwen3.5-0.8B", device, phase="train")
+print0(f"Loading pretrained model from: {args.pretrained_model_path}")
+model, tokenizer, meta_data_loaded = load_pretrained_hf(args.pretrained_model_path, device, phase="train")
 model_config_kwargs = meta_data_loaded["model_config"]
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 
@@ -367,18 +378,18 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    # if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-    #     model.eval()
-    #     with disable_fp8(orig_model):
-    #         results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-    #     print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-    #     wandb_run.log({
-    #         "step": step,
-    #         "total_training_flops": flops_so_far,
-    #         "core_metric": results["core_metric"],
-    #         "centered_results": results["centered_results"],
-    #     })
-    #     model.train()
+    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+        model.eval()
+        with disable_fp8(orig_model):
+            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        wandb_run.log({
+            "step": step,
+            "total_training_flops": flops_so_far,
+            "core_metric": results["core_metric"],
+            "centered_results": results["centered_results"],
+        })
+        model.train()
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape

@@ -13,24 +13,21 @@ import gc
 import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# Persistent torch.compile cache — avoids recompiling on every restart
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "nanoqwen35", "inductor"))
 import time
 import wandb
 import torch
+import torch._inductor.config as inductor_config
+inductor_config.fx_graph_cache = True  # persist compiled FX graphs to disk
 from nanoqwen35.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanoqwen35.tokenizer import get_token_bytes
 from nanoqwen35.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanoqwen35.loss_eval import evaluate_loss
 import torch.distributed as dist
 from nanoqwen35.flash_attention import HAS_FA3
 from nanoqwen35.engine import Engine
-from scripts.chat_eval import run_chat_eval
-
-from tasks.common import TaskMixture
-from tasks.gsm8k import GSM8K
-from tasks.mmlu import MMLU
-from tasks.smoltalk import SmolTalk
-from tasks.customjson import CustomJSON
-from tasks.spellingbee import SimpleSpelling, SpellingBee
+from tasks.sample import SampleSFT
+from tasks.sample_eval import run_sample_mc_eval
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -60,12 +57,7 @@ parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR a
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=200, help="evaluate val loss every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
-parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
-parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
-# Data mixture
-parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
-parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--chatcore-every", type=int, default=-1, help="evaluate ChatCORE metric every N steps (-1 = disable)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -118,7 +110,8 @@ for name, fallback, source in [
 
 orig_model = model
 model = torch.compile(model, dynamic=False)
-depth = model.config.n_layer
+depth = orig_model.config.n_layers
+model_config_kwargs = meta.get("model_config", {})
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -159,24 +152,10 @@ for group in optimizer.param_groups:
     group["lr"] = group["lr"] * args.init_lr_frac
     group["initial_lr"] = group["lr"]
 
-# SFT data mixture and DataLoader
-identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
-train_tasks = [
-    SmolTalk(split="train"), # 460K rows of general conversations
-    CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
-    CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
-    *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
-    *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
-    SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
-    SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
-]
-train_dataset = TaskMixture(train_tasks)
-print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
-val_dataset = TaskMixture([
-    SmolTalk(split="test"), # 24K rows in test set
-    MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
-    GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
-]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+# SFT datasets
+train_dataset = SampleSFT(split="train")
+val_dataset = SampleSFT(split="val")
+print0(f"Training dataset: {len(train_dataset):,} rows | Validation dataset: {len(val_dataset):,} rows")
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
@@ -346,7 +325,8 @@ while True:
     if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        tokens_per_eval_batch = args.device_batch_size * args.max_seq_len * ddp_world_size
+        eval_steps = max(1, args.eval_tokens // tokens_per_eval_batch)
         val_loss = evaluate_loss(model, val_loader, eval_steps)
         print0(f"Step {step:05d} | Validation loss: {val_loss:.4f}")
         if val_loss < min_val_loss:
@@ -361,36 +341,18 @@ while True:
 
     # once in a while: estimate the ChatCORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
-    chatcore_results = {}
     if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
         model.eval()
         engine = Engine(orig_model, tokenizer)
-        all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
-        categorical_tasks = {'ARC-Easy', 'ARC-Challenge', 'MMLU'}
-        baseline_accuracies = {
-            'ARC-Easy': 0.25, 'ARC-Challenge': 0.25, 'MMLU': 0.25,
-            'GSM8K': 0.0, 'HumanEval': 0.0, 'SpellingBee': 0.0,
-        }
-        task_results = {}
-        for task_name in all_tasks:
-            limit = args.chatcore_max_cat if task_name in categorical_tasks else args.chatcore_max_sample
-            max_problems = None if limit < 0 else limit  # -1 means no limit
-            acc = run_chat_eval(task_name, orig_model, tokenizer, engine,
-                                batch_size=args.device_batch_size, max_problems=max_problems)
-            task_results[task_name] = acc
-            print0(f"  {task_name}: {100*acc:.2f}%")
-        # Compute ChatCORE metrics (mean centered accuracy, ranges from 0=random to 1=perfect)
-        def centered_mean(tasks):
-            return sum((task_results[t] - baseline_accuracies[t]) / (1.0 - baseline_accuracies[t]) for t in tasks) / len(tasks)
-        chatcore = centered_mean(all_tasks)
-        chatcore_cat = centered_mean(categorical_tasks)
-        print0(f"Step {step:05d} | ChatCORE: {chatcore:.4f} | ChatCORE_cat: {chatcore_cat:.4f}")
+        mc_acc = run_sample_mc_eval(orig_model, tokenizer, engine)
+        # Centered accuracy: baseline is 0.25 (random chance on 4-choice questions)
+        chatcore = (mc_acc - 0.25) / (1.0 - 0.25)
+        print0(f"Step {step:05d} | SampleMC acc: {100*mc_acc:.2f}% | ChatCORE: {chatcore:.4f}")
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "chatcore_metric": chatcore,
-            "chatcore_cat": chatcore_cat,
-            **{f"chatcore/{task_name}": acc for task_name, acc in task_results.items()},
+            "chatcore/SampleMC": mc_acc,
         })
         model.train()
 
@@ -406,15 +368,7 @@ while True:
             {
                 "step": step,
                 "val_loss": val_loss, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
+                "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
             },
             rank=ddp_rank,
@@ -447,12 +401,14 @@ while True:
             group["momentum"] = muon_momentum
     if scaler is not None:
         scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         if is_ddp_initialized():
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
         scaler.step(optimizer)
         scaler.update()
     else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
     model.zero_grad(set_to_none=True)
     synchronize()
@@ -465,7 +421,7 @@ while True:
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**step) # debias the EMA (step already incremented)
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt

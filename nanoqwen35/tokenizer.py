@@ -36,6 +36,9 @@ class HuggingFaceTokenizer:
 
     def id_to_token(self, id):
         return self.tokenizer.id_to_token(id)
+    
+    def token_to_id(self, token):
+        return self.tokenizer.token_to_id(token)
 
     def _encode_one(self, text, prepend=None, append=None, num_threads=None):
         assert isinstance(text, str)
@@ -55,6 +58,7 @@ class HuggingFaceTokenizer:
     def get_bos_token_id(self):
         # Qwen3.5 does not have a bos token
         return None
+    
 
     def encode(self, text, *args, **kwargs):
         if isinstance(text, str):
@@ -135,15 +139,14 @@ class HuggingFaceTokenizer:
         ids.extend(self.encode("assistant\n"))
         return ids
 
-def get_tokenizer():
+def get_tokenizer(pretrained_dir=None):
     from nanoqwen35.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
     if os.path.exists(os.path.join(tokenizer_dir, "tokenizer.json")):
         return HuggingFaceTokenizer.from_directory(tokenizer_dir)
     else:
-        # Fallback to pretrained
-        return HuggingFaceTokenizer.from_directory("/home/truongnp5/Desktop/qwen35/Qwen3.5-0.8B")
+        return HuggingFaceTokenizer.from_pretrained(pretrained_dir)
 
 def get_token_bytes(device="cpu"):
     # Since we don't have token_bytes.pt anymore without training, we return None

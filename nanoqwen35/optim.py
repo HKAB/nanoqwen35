@@ -12,6 +12,9 @@ import torch.distributed as dist
 from torch import Tensor
 from nanoqwen35.common import COMPUTE_DTYPE
 
+# Allow adamw_step_fused to handle parameter tensors of varying shapes without recompiling
+torch._dynamo.config.force_parameter_static_shapes = False
+
 # -----------------------------------------------------------------------------
 """
 Good old AdamW optimizer, fused kernel.
@@ -116,16 +119,22 @@ def muon_step_fused(
     # Cast to bf16 for speed when available; skip cast otherwise (fp16 is unstable here due to limited exponent range)
     X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
-    if g.size(-2) > g.size(-1): # Tall matrix
+    # Skip iterations for rank-1 matrices (size -2 or -1 == 1, e.g. conv1d weights shaped
+    # (..., 1, k)).  For those the polar factor is just the row/col-normalized matrix, which
+    # the normalization step above already provides.  Running the polynomial on a 1×1 Gram
+    # matrix (A = X @ X.T is scalar ≈ 0.99) places the singular value outside the Polar
+    # Express convergence radius and produces NaN within 3 iterations.
+    if g.size(-2) > g.size(-1) and g.size(-1) > 1: # Tall matrix, full-rank in minor dim
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X.mT @ X
             B = b * A + c * (A @ A)
             X = a * X + X @ B
-    else: # Wide matrix (original math)
+    elif g.size(-2) > 1: # Wide or square matrix, full-rank in minor dim
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
+    # else: rank-1 matrix — keep the already-normalised X as the polar factor approximation
     g = X
 
     # Variance reduction
