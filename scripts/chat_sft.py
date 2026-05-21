@@ -110,7 +110,6 @@ for name, fallback, source in [
 
 orig_model = model
 model = torch.compile(model, dynamic=False)
-depth = orig_model.config.n_layers
 model_config_kwargs = meta.get("model_config", {})
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -358,8 +357,7 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", f"step_{step:05d}")
         save_checkpoint(
             checkpoint_dir,
             step,
