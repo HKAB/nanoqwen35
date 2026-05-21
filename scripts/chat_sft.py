@@ -371,6 +371,7 @@ while True:
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
             },
+            tokenizer=tokenizer,
             rank=ddp_rank,
         )
 

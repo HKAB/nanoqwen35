@@ -434,6 +434,7 @@ while True:
                     "total_training_time": total_training_time,
                 },
             },
+            tokenizer=tokenizer,
             rank=ddp_rank,
         )
 

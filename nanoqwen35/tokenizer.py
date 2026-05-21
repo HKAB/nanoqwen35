@@ -56,9 +56,7 @@ class HuggingFaceTokenizer:
         return self.tokenizer.token_to_id(text)
 
     def get_bos_token_id(self):
-        # Qwen3.5 does not have a bos token
-        return None
-    
+        return self.tokenizer.token_to_id("<|endoftext|>")
 
     def encode(self, text, *args, **kwargs):
         if isinstance(text, str):

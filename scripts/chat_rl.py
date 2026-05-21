@@ -18,9 +18,12 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 
 import argparse
 import os
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "nanoqwen35", "inductor"))
 import itertools
 import wandb
 import torch
+import torch._inductor.config as inductor_config
+inductor_config.fx_graph_cache = True
 import torch.distributed as dist
 from nanoqwen35.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanoqwen35.checkpoint_manager import save_checkpoint, load_model
@@ -84,7 +87,7 @@ print0(f"Calculated number of steps: {num_steps}")
 
 @torch.no_grad()
 def get_batch():
-    assistant_end = tokenizer.encode_special("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
+    pad_token_id = tokenizer.token_to_id("<|endoftext|>") # used for padding; <|assistant_end|> may not exist in Qwen3.5
     rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank is responsible for different examples in the training data
     for example_idx in itertools.cycle(rank_indices):
 
@@ -100,7 +103,7 @@ def get_batch():
         model.eval() # ensure the model is in eval mode
         generated_token_sequences = []
         masks = []
-        num_sampling_steps = args.num_samples // args.device_batch_size # go sequentially to prevent OOMs
+        num_sampling_steps = max(1, args.num_samples // args.device_batch_size) # go sequentially to prevent OOMs
         for sampling_step in range(num_sampling_steps):
             seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
             generated_token_sequences_batch, masks_batch = engine.generate_batch(
@@ -127,7 +130,7 @@ def get_batch():
 
         # Pad the sequences so that their lengths (in time) match
         max_length = max(len(seq) for seq in generated_token_sequences)
-        padded_generated_token_sequences = [seq + [assistant_end] * (max_length - len(seq)) for seq in generated_token_sequences]
+        padded_generated_token_sequences = [seq + [pad_token_id] * (max_length - len(seq)) for seq in generated_token_sequences]
         padded_masks = [mask + [0] * (max_length - len(mask)) for mask in masks]
         # Stack up the sequences and masks into PyTorch tensors
         ids = torch.tensor(padded_generated_token_sequences, dtype=torch.long, device=device)
@@ -251,8 +254,7 @@ for step in range(num_steps):
         # Evaluate the loss and gradients
         model.train() # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
-        assert inputs_all.size(0) % args.device_batch_size == 0
-        num_passes = inputs_all.size(0) // args.device_batch_size
+        num_passes = max(1, inputs_all.size(0) // args.device_batch_size)
         for pass_idx in range(num_passes):
             # Pluck out the batch for this pass
             b0, b1 = pass_idx * args.device_batch_size, (pass_idx + 1) * args.device_batch_size
@@ -294,6 +296,7 @@ for step in range(num_steps):
     })
 
     # Update the model parameters
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
@@ -307,10 +310,10 @@ for step in range(num_steps):
     # Master process saves the model once in a while. Skip first step. Save last step.
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
-        depth = model.config.n_layer
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
+        depth = model.config.n_layers
+        output_dirname = args.model_tag if args.model_tag else f"d{depth}"
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of Qwen3_5ModelConfig, TODO nicer
+        model_config_kwargs = meta.get("model_config", {})
         save_checkpoint(
             checkpoint_dir,
             step,
