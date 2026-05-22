@@ -118,24 +118,21 @@ def muon_step_fused(
     # Polar express
     # Cast to bf16 for speed when available; skip cast otherwise (fp16 is unstable here due to limited exponent range)
     X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    # If X is 4D convolution layer, we have to convert it to a 2D matrix by flattening the last three dims. The orthogonalization will still work well in this case.
+    if X.dim() > 3:
+        X = X.view(X.size(0), X.size(1), -1)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
-    # Skip iterations for rank-1 matrices (size -2 or -1 == 1, e.g. conv1d weights shaped
-    # (..., 1, k)).  For those the polar factor is just the row/col-normalized matrix, which
-    # the normalization step above already provides.  Running the polynomial on a 1×1 Gram
-    # matrix (A = X @ X.T is scalar ≈ 0.99) places the singular value outside the Polar
-    # Express convergence radius and produces NaN within 3 iterations.
-    if g.size(-2) > g.size(-1) and g.size(-1) > 1: # Tall matrix, full-rank in minor dim
+    if g.size(-2) > g.size(-1): # Tall matrix, full-rank in minor dim
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X.mT @ X
             B = b * A + c * (A @ A)
             X = a * X + X @ B
-    elif g.size(-2) > 1: # Wide or square matrix, full-rank in minor dim
+    else:
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
-    # else: rank-1 matrix — keep the already-normalised X as the polar factor approximation
-    g = X
+    g = X.view(g.shape) # Reshape back to original shape if we flattened for 4D conv
 
     # Variance reduction
     beta2 = beta2_t.to(g.dtype)
@@ -251,6 +248,9 @@ class MuonAdamW(torch.optim.Optimizer):
         state = self.state[p]
         num_params = len(params)
         shape, device, dtype = p.shape, p.device, p.dtype
+        # If shape is 4D (conv filters), we will treat it as 2D by flattening the last three dims, so the buffer shapes should reflect that
+        if len(shape) == 4:
+            shape = (shape[0], shape[1], shape[2] * shape[3])
 
         # Momentum for every individual parameter
         if "momentum_buffer" not in state:
@@ -261,11 +261,7 @@ class MuonAdamW(torch.optim.Optimizer):
         # For params with leading dims beyond the last two, those are preserved in the buffer shape
         # so that the buffer can broadcast with v_mean which has shape (num_params, *shape).
         if "second_momentum_buffer" not in state:
-            leading = shape[:-2]
-            if shape[-2] >= shape[-1]:
-                state_shape = (num_params, *leading, shape[-2], 1)
-            else:
-                state_shape = (num_params, *leading, 1, shape[-1])
+            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
@@ -472,6 +468,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
 
+        # If shape is 4D (conv filters), we will treat it as 2D by flattening the last three dims, so the buffer shapes should reflect that
+        if len(shape) == 4:
+            shape = (shape[0], shape[1], shape[2] * shape[3])
+
         # How many params does this rank own?
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
@@ -481,11 +481,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            leading = shape[:-2]
-            if shape[-2] >= shape[-1]:
-                state_shape = (chunk_size, *leading, shape[-2], 1)
-            else:
-                state_shape = (chunk_size, *leading, 1, shape[-1])
+            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 

@@ -311,8 +311,7 @@ for step in range(num_steps):
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
         depth = model.config.n_layers
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}"
-        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
+        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", f"step_{step:05d}")
         model_config_kwargs = meta.get("model_config", {})
         save_checkpoint(
             checkpoint_dir,

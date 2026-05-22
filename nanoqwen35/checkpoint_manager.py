@@ -27,7 +27,7 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
         torch.save(model_data, model_path)
         if tokenizer is not None:
-            tokenizer.save_pretrained(checkpoint_dir)
+            tokenizer.save(os.path.join(checkpoint_dir, 'tokenizer'))
         logger.info(f"Saved model parameters to: {model_path}")
         # Save the metadata dict as json
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
@@ -90,7 +90,7 @@ def build_model(checkpoint_dir, step, device, phase):
     else:
         model.train()
     # Load the Tokenizer
-    tokenizer = HuggingFaceTokenizer.from_pretrained(checkpoint_dir)
+    tokenizer = HuggingFaceTokenizer.from_directory(os.path.join(checkpoint_dir, 'tokenizer'))
     # Sanity check: compatibility between model and tokenizer
     # But because in Qwen3.5, we pad the embedding to a multiple of 256, the vocab size in the model config may be larger than the tokenizer vocab size.
     # assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"

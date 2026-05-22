@@ -137,14 +137,8 @@ class HuggingFaceTokenizer:
         ids.extend(self.encode("assistant\n"))
         return ids
 
-def get_tokenizer(pretrained_dir=None):
-    from nanoqwen35.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    if os.path.exists(os.path.join(tokenizer_dir, "tokenizer.json")):
-        return HuggingFaceTokenizer.from_directory(tokenizer_dir)
-    else:
-        return HuggingFaceTokenizer.from_pretrained(pretrained_dir)
+def get_tokenizer(model_id):
+    return HuggingFaceTokenizer.from_pretrained(model_id)
 
 def get_token_bytes(device="cpu"):
     # Since we don't have token_bytes.pt anymore without training, we return None
