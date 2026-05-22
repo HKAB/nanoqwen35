@@ -10,7 +10,7 @@ Further contributions from @karpathy and @chrisjmccormick.
 import torch
 import torch.distributed as dist
 from torch import Tensor
-from nanochat.common import COMPUTE_DTYPE
+from nanoqwen35.common import COMPUTE_DTYPE
 
 # -----------------------------------------------------------------------------
 """

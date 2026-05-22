@@ -17,6 +17,8 @@ parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the model, get a single response back')
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
+parser.add_argument('-n', '--max-tokens', type=int, default=1024, help='Max tokens to generate per response')
+parser.add_argument('--no-thinking', action='store_true', help='Disable chain-of-thought <think> prefix')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 args = parser.parse_args()
 
@@ -26,10 +28,10 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
 
-# Special tokens for the chat state machine
+# Special tokens
 bos = tokenizer.get_bos_token_id()
-user_start, user_end = tokenizer.encode_special("<|user_start|>"), tokenizer.encode_special("<|user_end|>")
-assistant_start, assistant_end = tokenizer.encode_special("<|assistant_start|>"), tokenizer.encode_special("<|assistant_end|>")
+im_start = tokenizer.encode_special("<|im_start|>")
+im_end = tokenizer.encode_special("<|im_end|>")
 
 def safe_append(lst, val):
     if val is not None:
@@ -76,31 +78,39 @@ while True:
     if not user_input:
         continue
 
-    # Add User message to the conversation
-    safe_append(conversation_tokens, user_start)
+    # Add user turn: <|im_start|>user\n{content}<|im_end|>\n
+    safe_append(conversation_tokens, im_start)
+    conversation_tokens.extend(tokenizer.encode("user\n"))
     conversation_tokens.extend(tokenizer.encode(user_input))
-    safe_append(conversation_tokens, user_end)
-    
-    # Kick off the assistant
-    safe_append(conversation_tokens, assistant_start)
+    safe_append(conversation_tokens, im_end)
+    conversation_tokens.extend(tokenizer.encode("\n"))
+
+    # Kick off assistant turn: <|im_start|>assistant\n[<think>\n]
+    safe_append(conversation_tokens, im_start)
+    conversation_tokens.extend(tokenizer.encode("assistant\n"))
+    if not args.no_thinking:
+        conversation_tokens.extend(tokenizer.encode("<think>\n"))
+    else:
+        conversation_tokens.extend(tokenizer.encode("<think>\n\n</think>\n\n"))
+
     generate_kwargs = {
         "num_samples": 1,
-        "max_tokens": 256,
+        "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "top_k": args.top_k,
     }
     response_tokens = []
     print("\nAssistant: ", end="", flush=True)
     for token_column, token_masks in engine.generate(conversation_tokens, **generate_kwargs):
-        token = token_column[0] # pop the batch dimension (num_samples=1)
+        token = token_column[0]
         response_tokens.append(token)
         token_text = tokenizer.decode([token])
         print(token_text, end="", flush=True)
     print()
-    # we have to ensure that the assistant end token is the last token
-    # so even if generation ends due to max tokens, we have to append it to the end
-    if assistant_end is not None and response_tokens[-1] != assistant_end:
-        response_tokens.append(assistant_end)
+    # Ensure the turn ends with <|im_end|>\n
+    if im_end is not None and (not response_tokens or response_tokens[-1] != im_end):
+        response_tokens.append(im_end)
+    response_tokens.extend(tokenizer.encode("\n"))
     conversation_tokens.extend(response_tokens)
 
     # In the prompt mode, we only want a single response and exit
