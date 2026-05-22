@@ -118,11 +118,12 @@ def muon_step_fused(
     # Polar express
     # Cast to bf16 for speed when available; skip cast otherwise (fp16 is unstable here due to limited exponent range)
     X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
-    # If X is 4D convolution layer, we have to convert it to a 2D matrix by flattening the last three dims. The orthogonalization will still work well in this case.
+    orig_shape = g.shape
+    # Flatten conv params (dim > 3) to (batch, rows, cols) so all ops work on 3D tensors
     if X.dim() > 3:
         X = X.view(X.size(0), X.size(1), -1)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
-    if g.size(-2) > g.size(-1): # Tall matrix, full-rank in minor dim
+    if X.size(-2) > X.size(-1): # Use flattened X dims, not original g dims
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X.mT @ X
             B = b * A + c * (A @ A)
@@ -132,9 +133,10 @@ def muon_step_fused(
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
-    g = X.view(g.shape) # Reshape back to original shape if we flattened for 4D conv
+    # Keep g in flattened 3D form through variance reduction so second_momentum_buffer shapes match
+    g = X
 
-    # Variance reduction
+    # Variance reduction (g is 3D: (batch, rows, cols) even for conv params)
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
@@ -146,6 +148,9 @@ def muon_step_fused(
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
+
+    # Reshape back to original param shape before applying the update
+    g = g.view(orig_shape)
 
     # Cautious weight decay + parameter update
     lr = lr_t.to(g.dtype)
@@ -248,23 +253,23 @@ class MuonAdamW(torch.optim.Optimizer):
         state = self.state[p]
         num_params = len(params)
         shape, device, dtype = p.shape, p.device, p.dtype
-        # If shape is 4D (conv filters), we will treat it as 2D by flattening the last three dims, so the buffer shapes should reflect that
-        if len(shape) == 4:
-            shape = (shape[0], shape[1], shape[2] * shape[3])
 
         # Momentum for every individual parameter
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         momentum_buffer = state["momentum_buffer"]
 
-        # Second momentum buffer is factored along the last two dims (per-row or per-column).
-        # For params with leading dims beyond the last two, those are preserved in the buffer shape
-        # so that the buffer can broadcast with v_mean which has shape (num_params, *shape).
+        # For conv params (shape has >2 dims), flatten to effective 2D: (shape[0], shape[1]*...*shape[-1]).
+        # The kernel flattens stacked tensors the same way, so buffer shapes must match that view.
+        flat_rows = shape[0]
+        flat_cols = p.numel() // flat_rows  # product of all dims except the first
+
+        # Second momentum buffer is factored along the flattened 2D dims (per-row or per-column).
         if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+            state_shape = (num_params, flat_rows, 1) if flat_rows >= flat_cols else (num_params, 1, flat_cols)
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         second_momentum_buffer = state["second_momentum_buffer"]
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        red_dim = -1 if flat_rows >= flat_cols else -2
 
         # Stack grads and params (NOTE: this assumes all params have the same shape)
         stacked_grads = torch.stack([p.grad for p in params])
@@ -273,7 +278,7 @@ class MuonAdamW(torch.optim.Optimizer):
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, flat_rows / flat_cols)**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
 
         # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
@@ -468,22 +473,20 @@ class DistMuonAdamW(torch.optim.Optimizer):
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
 
-        # If shape is 4D (conv filters), we will treat it as 2D by flattening the last three dims, so the buffer shapes should reflect that
-        if len(shape) == 4:
-            shape = (shape[0], shape[1], shape[2] * shape[3])
-
         # How many params does this rank own?
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
 
         # Get or create group-level state
         state = self.state[p]
+        flat_rows = shape[0]
+        flat_cols = p.numel() // flat_rows
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+            state_shape = (chunk_size, flat_rows, 1) if flat_rows >= flat_cols else (chunk_size, 1, flat_cols)
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        red_dim = -1 if flat_rows >= flat_cols else -2
 
         # Build output buffer for all_gather
         updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
@@ -495,7 +498,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
             self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            self._muon_lr_t.fill_(group["lr"] * max(1.0, flat_rows / flat_cols)**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,

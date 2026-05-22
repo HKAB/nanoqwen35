@@ -122,7 +122,7 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer(pretrained_dir=args.pretrained_model_path)
+tokenizer = get_tokenizer("Qwen/Qwen3.5-0.8B-Base")
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
