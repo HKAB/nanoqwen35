@@ -3,17 +3,14 @@ A nice and efficient mixed AdamW/Muon Combined Optimizer.
 Usually the embeddings and scalars go into AdamW, and the matrix parameters go into Muon.
 Two versions are provided (MuonAdamW, DistMuonAdamW), for single GPU and distributed.
 
-Addapted from: https://github.com/KellerJordan/modded-nanoqwen
+Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
-from nanoqwen35.common import COMPUTE_DTYPE
-
-# Allow adamw_step_fused to handle parameter tensors of varying shapes without recompiling
-torch._dynamo.config.force_parameter_static_shapes = False
+from nanochat.common import COMPUTE_DTYPE
 
 # -----------------------------------------------------------------------------
 """
@@ -21,7 +18,7 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=True, fullgraph=True)
+@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -54,8 +51,8 @@ def adamw_step_fused(
 
 # -----------------------------------------------------------------------------
 """
-Muon optimizer adapted and simplified from modded-nanoqwen.
-https://github.com/KellerJordan/modded-nanoqwen
+Muon optimizer adapted and simplified from modded-nanogpt.
+https://github.com/KellerJordan/modded-nanogpt
 
 Background:
 Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -75,7 +72,7 @@ NorMuon variance reduction: per-neuron/column adaptive learning rate that normal
 update scales after orthogonalization (Muon's output has non-uniform scales across neurons).
 https://arxiv.org/pdf/2510.05491
 
-Some of the changes in nanoqwen35 implementation:
+Some of the changes in nanochat implementation:
 - Uses a simpler, more general approach to parameter grouping and stacking
 - Uses a single fused kernel for the momentum -> polar_express -> variance_reduction -> update step
 - Makes no assumptions about model architecture (e.g. that attention weights are fused into QKVO format)
@@ -91,7 +88,7 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=True, fullgraph=True)
+@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
@@ -118,25 +115,20 @@ def muon_step_fused(
     # Polar express
     # Cast to bf16 for speed when available; skip cast otherwise (fp16 is unstable here due to limited exponent range)
     X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
-    orig_shape = g.shape
-    # Flatten conv params (dim > 3) to (batch, rows, cols) so all ops work on 3D tensors
-    if X.dim() > 3:
-        X = X.view(X.size(0), X.size(1), -1)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
-    if X.size(-2) > X.size(-1): # Use flattened X dims, not original g dims
+    if g.size(-2) > g.size(-1): # Tall matrix
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X.mT @ X
             B = b * A + c * (A @ A)
             X = a * X + X @ B
-    else:
+    else: # Wide matrix (original math)
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
-    # Keep g in flattened 3D form through variance reduction so second_momentum_buffer shapes match
     g = X
 
-    # Variance reduction (g is 3D: (batch, rows, cols) even for conv params)
+    # Variance reduction
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
@@ -148,9 +140,6 @@ def muon_step_fused(
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
-
-    # Reshape back to original param shape before applying the update
-    g = g.view(orig_shape)
 
     # Cautious weight decay + parameter update
     lr = lr_t.to(g.dtype)
@@ -259,17 +248,12 @@ class MuonAdamW(torch.optim.Optimizer):
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         momentum_buffer = state["momentum_buffer"]
 
-        # For conv params (shape has >2 dims), flatten to effective 2D: (shape[0], shape[1]*...*shape[-1]).
-        # The kernel flattens stacked tensors the same way, so buffer shapes must match that view.
-        flat_rows = shape[0]
-        flat_cols = p.numel() // flat_rows  # product of all dims except the first
-
-        # Second momentum buffer is factored along the flattened 2D dims (per-row or per-column).
+        # Second momentum buffer is factored, either per-row or per-column
         if "second_momentum_buffer" not in state:
-            state_shape = (num_params, flat_rows, 1) if flat_rows >= flat_cols else (num_params, 1, flat_cols)
+            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         second_momentum_buffer = state["second_momentum_buffer"]
-        red_dim = -1 if flat_rows >= flat_cols else -2
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Stack grads and params (NOTE: this assumes all params have the same shape)
         stacked_grads = torch.stack([p.grad for p in params])
@@ -278,7 +262,7 @@ class MuonAdamW(torch.optim.Optimizer):
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, flat_rows / flat_cols)**0.5)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
 
         # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
@@ -479,14 +463,12 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Get or create group-level state
         state = self.state[p]
-        flat_rows = shape[0]
-        flat_cols = p.numel() // flat_rows
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, flat_rows, 1) if flat_rows >= flat_cols else (chunk_size, 1, flat_cols)
+            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if flat_rows >= flat_cols else -2
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Build output buffer for all_gather
         updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
@@ -498,7 +480,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
             self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, flat_rows / flat_cols)**0.5)
+            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,

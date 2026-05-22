@@ -137,7 +137,16 @@ if args.load_optimizer:
         del optimizer_data
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        # Zero Muon momentum buffers: pretraining momentum points in the pretraining gradient
+        # direction (~72% of update at β=0.85), causing wrong-direction updates for SFT.
+        # The adaptive second moments (variance normalization) are kept as they are still useful.
+        for group in optimizer.param_groups:
+            if group["kind"] == "muon":
+                for p in group["params"]:
+                    state = optimizer.state[p]
+                    if "momentum_buffer" in state:
+                        state["momentum_buffer"].zero_()
+        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers zeroed, second moments kept, LRs reset)")
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 
@@ -244,21 +253,21 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
 
-        # Stopping condition to respect num_iterations, if given
+        # Stopping: iteration count wins when specified; dataset exhaustion otherwise
         it += 1
-        if 0 < args.num_iterations <= it and split == "train":
-            last_step = True
+        if split == "train":
+            if 0 < args.num_iterations <= it:
+                last_step = True
+            elif args.num_iterations <= 0 and consumed >= dataset_size:
+                last_step = True
 
         # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
-            current_epoch = epoch
+            current_epoch = consumed // dataset_size + 1
             if args.num_iterations > 0:
                 approx_progress = it / args.num_iterations
             else:
                 approx_progress = consumed / dataset_size
-            # Trigger last_step when we've consumed enough (instead of when cursor wraps)
-            if consumed >= dataset_size:
-                last_step = True
 
         # Build tensors
         use_cuda = device_type == "cuda"

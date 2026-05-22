@@ -469,7 +469,8 @@ class Qwen3_5Model(nn.Module):
         # All other params (transformer blocks and final norm)
         other_params = list(self.transformer.h.parameters()) + list(self.final_norm.parameters())
 
-        matrix_params = [p for p in other_params if p.ndim >= 2]
+        matrix_params = [p for p in other_params if p.ndim == 2]
+        nd_params = [p for p in other_params if p.ndim > 2] # For qwen3.5, these are mostly the conv1d weights in the linear attention blocks
         scalar_params = [p for p in other_params if p.ndim < 2]
 
         dmodel_lr_scale = (model_dim / 1024) ** -0.5
@@ -478,6 +479,7 @@ class Qwen3_5Model(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=scalar_params, lr=scalar_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=nd_params, lr=matrix_lr * dmodel_lr_scale, betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay),
         ]
         if use_muon:
             for shape in sorted({p.shape for p in matrix_params}):
