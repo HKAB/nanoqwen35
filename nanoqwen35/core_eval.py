@@ -193,7 +193,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
-    # Some models can't forward sequences beyond a certain length (e.g. Qwen3_5Model-2)
+    # Some models can't forward sequences beyond a certain length
     # In these cases, we have to truncate sequences to max length and adjust the indices
     if hasattr(model, 'max_seq_len') and model.max_seq_len is not None:
         max_tokens = model.max_seq_len

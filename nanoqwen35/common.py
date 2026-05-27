@@ -1,5 +1,5 @@
 """
-Common utilities for nanoqwen35.
+Common utilities for nanoqwen35. Copy directly from NANOQWEN.
 """
 
 import os
@@ -12,12 +12,12 @@ from filelock import FileLock
 
 # The dtype used for compute (matmuls, activations). Master weights stay fp32 for optimizer precision.
 # Linear layers cast their weights to this dtype in forward, replacing torch.amp.autocast.
-# Override with NANOCHAT_DTYPE env var: "bfloat16", "float16", "float32"
+# Override with NANOQWEN_DTYPE env var: "bfloat16", "float16", "float32"
 _DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 def _detect_compute_dtype():
-    env = os.environ.get("NANOCHAT_DTYPE")
+    env = os.environ.get("NANOQWEN_DTYPE")
     if env is not None:
-        return _DTYPE_MAP[env], f"set via NANOCHAT_DTYPE={env}"
+        return _DTYPE_MAP[env], f"set via NANOQWEN_DTYPE={env}"
     if torch.cuda.is_available():
         # bf16 requires SM 80+ (Ampere: A100, A10, etc.)
         # Older GPUs like V100 (SM 70) and T4 (SM 75) only have fp16 tensor cores
@@ -25,7 +25,7 @@ def _detect_compute_dtype():
         if capability >= (8, 0):
             return torch.bfloat16, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (bf16 supported)"
         # fp16 training requires GradScaler (not yet implemented), so fall back to fp32.
-        # Users can still force fp16 via NANOCHAT_DTYPE=float16 if they know what they're doing.
+        # Users can still force fp16 via NANOQWEN_DTYPE=float16 if they know what they're doing.
         return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
     return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
 COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
@@ -69,8 +69,8 @@ logger = logging.getLogger(__name__)
 
 def get_base_dir():
     # co-locate nanoqwen35 intermediates with other cached data in ~/.cache (by default)
-    if os.environ.get("NANOCHAT_BASE_DIR"):
-        nanoqwen35_dir = os.environ.get("NANOCHAT_BASE_DIR")
+    if os.environ.get("NANOQWEN_BASE_DIR"):
+        nanoqwen35_dir = os.environ.get("NANOQWEN_BASE_DIR")
     else:
         home_dir = os.path.expanduser("~")
         cache_dir = os.path.join(home_dir, ".cache")
@@ -122,14 +122,15 @@ def print0(s="",**kwargs):
 def print_banner():
     # Cool DOS Rebel font ASCII banner made with https://manytools.org/hacker-tools/ascii-banner/
     banner = """
-                                                       █████                █████
-                                                      ░░███                ░░███
-     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
-    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
-     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
-     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
-     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
-    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+     ███▄    █  ▄▄▄       ███▄    █  ▒█████    █████   █     █░▓█████  ███▄    █ 
+ ██ ▀█   █ ▒████▄     ██ ▀█   █ ▒██▒  ██▒▒██▓  ██▒▓█░ █ ░█░▓█   ▀  ██ ▀█   █ 
+▓██  ▀█ ██▒▒██  ▀█▄  ▓██  ▀█ ██▒▒██░  ██▒▒██▒  ██░▒█░ █ ░█ ▒███   ▓██  ▀█ ██▒
+▓██▒  ▐▌██▒░██▄▄▄▄██ ▓██▒  ▐▌██▒▒██   ██░░██  █▀ ░░█░ █ ░█ ▒▓█  ▄ ▓██▒  ▐▌██▒
+▒██░   ▓██░ ▓█   ▓██▒▒██░   ▓██░░ ████▓▒░░▒███▒█▄ ░░██▒██▓ ░▒████▒▒██░   ▓██░
+░ ▒░   ▒ ▒  ▒▒   ▓▒█░░ ▒░   ▒ ▒ ░ ▒░▒░▒░ ░░ ▒▒░ ▒ ░ ▓░▒ ▒  ░░ ▒░ ░░ ▒░   ▒ ▒ 
+░ ░░   ░ ▒░  ▒   ▒▒ ░░ ░░   ░ ▒░  ░ ▒ ▒░  ░ ▒░  ░   ▒ ░ ░   ░ ░  ░░ ░░   ░ ▒░
+   ░   ░ ░   ░   ▒      ░   ░ ░ ░ ░ ░ ▒     ░   ░   ░   ░     ░      ░   ░ ░ 
+         ░       ░  ░         ░     ░ ░      ░        ░       ░  ░         ░ 
     """
     print0(banner)
 

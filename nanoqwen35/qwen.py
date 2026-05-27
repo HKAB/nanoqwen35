@@ -52,7 +52,7 @@ class FeedForward(nn.Module):
     def forward(self, x):
         x_fc1 = self.fc1(x)
         x_fc2 = self.fc2(x)
-        x = F.silu(x_fc1) * x_fc2
+        x = F.silu(x_fc1) * x_fc2 # O(N) ops
         return self.fc3(x)
 
 class RMSNorm(nn.Module):
@@ -281,10 +281,10 @@ def torch_recurrent_gated_delta_rule(query, key, value, g, beta, initial_state=N
         beta_t = beta[:, :, i].unsqueeze(-1)
 
         last_recurrent_state = last_recurrent_state * g_t
-        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
+        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2) # O(value_head_dim²)
         delta = (v_t - kv_mem) * beta_t
-        last_recurrent_state = last_recurrent_state + (k_t.unsqueeze(-1) * delta.unsqueeze(-2))
-        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
+        last_recurrent_state = last_recurrent_state + (k_t.unsqueeze(-1) * delta.unsqueeze(-2)) # 2*O(value_head_dim²)
+        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2) # O(value_head_dim²)
 
     if not output_final_state:
         last_recurrent_state = None
@@ -441,9 +441,89 @@ class Qwen3_5Model(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def estimate_flops(self):
-        nparams = sum(p.numel() for p in self.parameters())
-        return 6 * nparams
+    def estimate_flops(self, global_batch_size, seq_len):
+        # Estimation from: https://docs.nvidia.com/nemo/automodel/0.4.0/_modules/nemo_automodel/components/utils/flops_utils.html#qwen3_5_flops
+        attention_heads = self.config.num_attention_heads
+        head_dim = self.config.head_dim
+        query_groups = self.config.num_key_value_heads
+
+        hs = self.config.hidden_size
+        query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
+        # --- Standard (full) attention flops per layer ---
+        # Qwen3.5 uses gated attention: Q proj outputs 2x (query + gate), applied as sigmoid(gate)*attn
+        
+        causal_self_attn = True
+        attn_output_gate = self.config.attn_output_gate
+        q_gate_multiplier = 2 if attn_output_gate else 1
+        full_attn_per_layer = (
+            6
+            * global_batch_size
+            * hs
+            * hs
+            * query_projection_to_hidden_size_ratio
+            * (
+                (query_groups / attention_heads * 2 + q_gate_multiplier)  # QKV gemm (Q is 2x with gate)
+                                                                          # K, V the hidden size is divided 
+                                                                          # by attention_heads, because of 
+                                                                          # grouped query, multiply by query_groups,
+                                                                          # *2 by Key and Value
+                + (seq_len / hs * 2 * (0.5 if causal_self_attn else 1))   # attention BMM (seq_len**2 * head_dim, cancel 
+                                                                          # out 1 hs; *2 for QK and AV
+                + 1                                                       # output proj gemm
+            )
+        )
+
+        # --- GDN (linear attention) flops per layer ---
+        qk_dim = self.config.linear_key_head_dim * self.config.linear_num_key_heads
+        v_dim = self.config.linear_value_head_dim * self.config.linear_num_value_heads
+        linear_num_value_heads = self.config.linear_num_value_heads
+        linear_conv_kernel_dim = self.config.linear_conv_kernel_dim
+        linear_value_head_dim = self.config.linear_value_head_dim
+
+        gdn_attn_per_layer = (
+            6
+            * global_batch_size
+            *
+            (
+                hs * (2 * qk_dim + 2 * v_dim + 2 * linear_num_value_heads) # Cost for: in_proj_qkv, in_proj_z, in_proj_b, in_proj_a
+                + linear_conv_kernel_dim * (2 * qk_dim + v_dim) # cost for conv1d
+                + linear_num_value_heads * (linear_value_head_dim**2) * 4 # Cost noted in recurrent gated delta rule implementation above
+                + hs * v_dim # output projection
+            )
+        )
+
+        # Total attention flops
+        num_full_attn_layers = sum(1 for t in self.config.layer_types if t == "full_attention")
+        num_gdn_layers = sum(1 for t in self.config.layer_types if t == "linear_attention")
+        attention_flops = full_attn_per_layer * num_full_attn_layers + gdn_attn_per_layer * num_gdn_layers
+
+        # Dense MLP
+        layers = self.config.num_hidden_layers
+        gated_linear_multiplier = 2  # SwiGLU: gate + up projections
+        ffn_hs = self.config.intermediate_size
+        mlp_flops = 6 * global_batch_size * layers * seq_len * hs * (1 + gated_linear_multiplier) * ffn_hs # calculation of FeedForward (silu is negligible compared to the linear layers)
+
+        # --- Vocab flops ---
+        vocab_size = self.config.vocab_size
+        vocab_flops = 6 * global_batch_size * seq_len * hs * vocab_size
+        # --- MTP flops ---
+        mtp_num_layers = self.config.mtp_num_hidden_layers
+        mtp_flops = 0
+        # We didn't implement MTP in this version, but if we did, the main additional cost would be:
+        # if mtp_num_layers > 0:
+        #     # Embedding projection per MTP layer: 2*hs -> hs
+        #     mtp_flops += 6 * global_batch_size * seq_len * hs * 2 * hs * mtp_num_layers
+        #     # MTP layers reuse the last transformer layer pattern (assumed full attention)
+        #     mtp_flops += full_attn_per_layer * mtp_num_layers
+        #     # For dense model
+        #     # MTP MLP (same as main model's last layer)
+        #     mtp_mlp_per_layer = 6 * global_batch_size * seq_len * hs * (1 + gated_linear_multiplier) * ffn_hs
+        #     mtp_flops += mtp_mlp_per_layer * mtp_num_layers
+        #     # Vocab projection per MTP layer
+        #     mtp_flops += 6 * global_batch_size * seq_len * hs * vocab_size * mtp_num_layers
+
+        return attention_flops + mlp_flops + vocab_flops + mtp_flops
+
         
     def num_scaling_params(self):
         wte = self.transformer.wte.weight.numel()

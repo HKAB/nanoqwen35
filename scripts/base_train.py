@@ -239,7 +239,7 @@ print0(f"Parameter counts:")
 for key, value in param_counts.items():
     print0(f"{key:24s}: {value:,}")
 num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
+num_flops_per_token = model.estimate_flops(args.device_batch_size*ddp_world_size, args.max_seq_len)
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # Manually configured batch size / LR / WD
@@ -396,13 +396,11 @@ while True:
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
-            "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
+            "Một cây làm chẳng nên non,",
+            "Thấy Tấm bắt được một giỏ đầy, Cám bảo chị:",
+            "Trăm năm trong cõi người ta,"
+            "Cacbon có 2 hóa trị là"
+            "Vừa gà vừa chó bó lại cho tròn 36 con 100 chân chẵn. Hỏi có bao nhiêu con gà, bao nhiêu con chó?"
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:

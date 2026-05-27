@@ -5,7 +5,7 @@ BOS-aligned bestfit:
    - Every row starts with BOS token
    - Documents packed using best-fit algorithm to minimize cropping
    - When no document fits remaining space, crops a document to fill exactly
-   - 100% utilization (no padding), ~35% tokens cropped at T=2048
+   - 100% utilization (no padding),
 
 Compared to the original tokenizing_distributed_data_loader:
 BOS-aligned loses ~35% of tokens to cropping, but ensures that
@@ -32,8 +32,7 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
-    parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
+    parquet_paths = list_parquet_files()
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
@@ -91,7 +90,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     Key properties:
     - Every row starts with BOS
     - 100% utilization (no padding, every token is trained on)
-    - Approximately 35% of all tokens are discarded due to cropping
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 

@@ -10,9 +10,6 @@ Default is all three: --eval core,loss,sample
 
 Examples:
 
-    # Evaluate a HuggingFace model (e.g. Qwen3_5Model-2 124M) using 8 GPUs
-    torchrun --nproc_per_node=8 -m scripts.base_eval --hf-path openai-community/qwen2
-
     # Evaluate a nanoqwen35 model (e.g. d24) using 8 GPUs
     torchrun --nproc_per_node=8 -m scripts.base_eval --model-tag d24 --device-batch-size=16
 
@@ -32,59 +29,11 @@ import argparse
 import torch
 
 from nanoqwen35.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
-from nanoqwen35.tokenizer import HuggingFaceTokenizer, get_token_bytes
 from nanoqwen35.checkpoint_manager import load_pretrained_hf
 from nanoqwen35.core_eval import evaluate_task
 from nanoqwen35.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanoqwen35.loss_eval import evaluate_loss
 from nanoqwen35.engine import Engine
-
-# -----------------------------------------------------------------------------
-# HuggingFace loading utilities
-
-class ModelWrapper:
-    """Lightweight wrapper to give HuggingFace models a nanoqwen35-compatible interface."""
-    def __init__(self, model, max_seq_len=None):
-        self.model = model
-        self.max_seq_len = max_seq_len
-
-    def __call__(self, input_ids, targets=None, loss_reduction='mean'):
-        logits = self.model(input_ids).logits
-        if targets is None:
-            return logits
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1),
-            ignore_index=-1,
-            reduction=loss_reduction
-        )
-        return loss
-
-    def get_device(self):
-        return next(self.model.parameters()).device
-
-
-def load_hf_model(hf_path: str, device):
-    """Load a HuggingFace model and tokenizer."""
-    print0(f"Loading HuggingFace model from: {hf_path}")
-    from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(hf_path)
-    model.to(device)
-    model.eval()
-    max_seq_len = 1024 if "qwen2" in hf_path else None
-    model = ModelWrapper(model, max_seq_len=max_seq_len)
-    tokenizer = HuggingFaceTokenizer.from_pretrained(hf_path)
-    return model, tokenizer
-
-
-def get_hf_token_bytes(tokenizer, device="cpu"):
-    """Compute token_bytes tensor for a HuggingFace tokenizer."""
-    vocab_size = tokenizer.tokenizer.get_vocab_size()
-    token_bytes = torch.zeros(vocab_size, dtype=torch.int64, device=device)
-    for token_id in range(vocab_size):
-        token_str = tokenizer.tokenizer.decode([token_id])
-        token_bytes[token_id] = len(token_str.encode('utf-8'))
-    return token_bytes
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
@@ -178,7 +127,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
     parser.add_argument('--eval', type=str, default='core,loss,sample', help='Comma-separated evaluations to run: core,loss,sample (default: all)')
-    parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path (e.g. openai-community/qwen2-xl)')
+    parser.add_argument('--pretrained-model-path', type=str, default='./Qwen3.5-0.8B', help='path or HF repo id of pretrained model/tokenizer')
     parser.add_argument('--model-tag', type=str, default=None, help='nanoqwen35 model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
@@ -197,20 +146,12 @@ def main():
     # Distributed / precision setup
     device_type = autodetect_device_type() if args.device_type == '' else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+
     # Load model and tokenizer
-    is_hf_model = args.hf_path is not None
-    if is_hf_model:
-        model, tokenizer = load_hf_model(args.hf_path, device)
-        sequence_len = getattr(model, "context_length", 1024)
-        token_bytes = get_hf_token_bytes(tokenizer, device=device)
-        model_name = args.hf_path
-        model_slug = args.hf_path.replace("/", "-")
-    else:
-        model, tokenizer, meta = load_pretrained_hf("/home/truongnp5/Desktop/qwen35/Qwen3.5-0.8B", device, phase="eval", model_tag=args.model_tag, step=args.step)
-        sequence_len = meta["model_config"].get("context_length", meta["model_config"].get("sequence_len", 1024))
-        pass
-        model_name = f"base_model (step {meta['step']})"
-        model_slug = f"base_model_{meta['step']:06d}"
+    model, tokenizer, meta = load_pretrained_hf(args.pretrained_model_path, device, phase="eval", model_tag=args.model_tag, step=args.step)
+    sequence_len = meta["model_config"].get("context_length", meta["model_config"].get("sequence_len", 1024))
+    model_name = f"base_model (step {meta['step']})"
+    model_slug = f"base_model_{meta['step']:06d}"
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
@@ -222,24 +163,22 @@ def main():
     unconditioned_samples = []
 
     # --- Sampling ---
-    if 'sample' in eval_modes and not is_hf_model:
+    if 'sample' in eval_modes:
         print0("\n" + "="*80)
         print0("Model Samples")
         print0("="*80)
         if ddp_rank == 0:
             prompts = [
-                "The capital of France is",
-                "The chemical symbol of gold is",
-                "If yesterday was Friday, then tomorrow will be",
-                "The opposite of hot is",
-                "The planets of the solar system are:",
-                "My favorite color is",
-                "If 5*x + 3 = 13, then x is",
+                "Một cây làm chẳng nên non,",
+                "Thấy Tấm bắt được một giỏ đầy, Cám bảo chị:",
+                "Trăm năm trong cõi người ta,"
+                "Cacbon có 2 hóa trị là"
+                "Vừa gà vừa chó bó lại cho tròn 36 con 100 chân chẵn. Hỏi có bao nhiêu con gà, bao nhiêu con chó?"
             ]
             engine = Engine(model, tokenizer)
             print0("\nConditioned samples:")
             for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
+                tokens = tokenizer(prompt, prepend=tokenizer.get_bos_token_id())
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
                 sample_str = tokenizer.decode(sample[0])
                 print0("-" * 80)
@@ -247,15 +186,13 @@ def main():
                 samples.append(sample_str)
 
             print0("\nUnconditioned samples:")
-            tokens = tokenizer("", prepend="<|bos|>")
+            tokens = tokenizer("", prepend=tokenizer.get_bos_token_id())
             uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
             for sample in uncond:
                 sample_str = tokenizer.decode(sample)
                 print0("-" * 80)
                 print0(sample_str)
                 unconditioned_samples.append(sample_str)
-    elif 'sample' in eval_modes and is_hf_model:
-        print0("\nSkipping sampling for HuggingFace models (not supported)")
 
     # --- BPB evaluation ---
     if 'loss' in eval_modes:
@@ -264,7 +201,6 @@ def main():
         print0("="*80)
         tokens_per_step = args.device_batch_size * sequence_len * ddp_world_size
         if args.split_tokens % tokens_per_step != 0:
-            # Adjust to nearest multiple
             args.split_tokens = (args.split_tokens // tokens_per_step) * tokens_per_step
             print0(f"Adjusted split_tokens to {args.split_tokens} (must be divisible by {tokens_per_step})")
         steps = args.split_tokens // tokens_per_step
