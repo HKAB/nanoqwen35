@@ -1,14 +1,11 @@
 """
 Train model. From root directory of the project, run as:
 
-python -m scripts.base_train
+python -m scripts.base_train --pretrained-model-path ./Qwen3.5-0.8B --dataset-path /path/to/dataset --run my_run_name
 
 or distributed as:
 
 torchrun --nproc_per_node=8 -m scripts.base_train
-
-If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
 """
 
 import os
@@ -83,6 +80,7 @@ parser.add_argument(
     default="./Qwen3.5-0.8B",
     help="path or HF repo id of pretrained model/tokenizer",
 )
+parser.add_argument("--dataset-path", type=str, required=True, help="dataset path that contain parquet files")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -320,8 +318,8 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, dataset_path=args.dataset_path)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, dataset_path=args.dataset_path)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
