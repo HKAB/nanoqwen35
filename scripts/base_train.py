@@ -64,6 +64,8 @@ parser.add_argument("--scalar-lr", type=float, default=0.05, help="learning rate
 parser.add_argument("--warmup-steps", type=int, default=100, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.2, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.1, help="final LR as fraction of initial LR")
+parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute activations during backward to save memory (allows larger --device-batch-size)")
+parser.add_argument("--logit-softcap", type=float, default=0.0, help="tanh softcap applied to logits before cross-entropy loss (0 = disabled, 15-30 typical)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val loss every N steps (-1 = disable)")
@@ -143,6 +145,16 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+
+# Gradient checkpointing (must be set before torch.compile)
+if args.gradient_checkpointing:
+    orig_model.enable_gradient_checkpointing()
+    print0("✓ Gradient checkpointing enabled (activation memory saved, ~33% extra compute)")
+
+# Logit softcap
+if args.logit_softcap > 0:
+    orig_model.logit_softcap = args.logit_softcap
+    print0(f"✓ Logit softcap enabled: {args.logit_softcap}")
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)

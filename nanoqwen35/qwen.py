@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 from nanoqwen35.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanoqwen35.optim import MuonAdamW, DistMuonAdamW
@@ -344,7 +345,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             kernel_size=self.conv_kernel_size,
             groups=self.conv_dim,
             padding=self.conv_kernel_size - 1
-        )
+        ).to(dtype=COMPUTE_DTYPE)
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         A = torch.empty(self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
@@ -468,9 +469,14 @@ class Qwen3_5Model(nn.Module):
         )
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
-        
+        self.use_gradient_checkpointing = False
+        self.logit_softcap = 0.0  # set via model.logit_softcap = N after load
+
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
+
+    def enable_gradient_checkpointing(self):
+        self.use_gradient_checkpointing = True
 
     def get_device(self):
         return self.transformer.wte.weight.device
@@ -635,14 +641,22 @@ class Qwen3_5Model(nn.Module):
         cos_sin = (self.cos[T0:T0+T], self.sin[T0:T0+T])
         
         x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
-        
-        for i, block in enumerate(self.transformer.h):
-            x, _ = block(x, mask=None, cos=cos_sin[0], sin=cos_sin[1], start_pos=T0, cache=kv_cache)
+
+        for block in self.transformer.h:
+            if self.use_gradient_checkpointing and self.training:
+                x, _ = gradient_checkpoint(
+                    block, x, None, cos_sin[0], cos_sin[1], T0, None,
+                    use_reentrant=False,
+                )
+            else:
+                x, _ = block(x, mask=None, cos=cos_sin[0], sin=cos_sin[1], start_pos=T0, cache=kv_cache)
         
         x = self.final_norm(x)
         logits = self.lm_head(x)
         
         if targets is not None:
+            if self.logit_softcap > 0:
+                logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         return logits
