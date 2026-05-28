@@ -14,6 +14,15 @@ from nanoqwen35.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanoqwen35.optim import MuonAdamW, DistMuonAdamW
 from nanoqwen35.flash_attention import flash_attn
 
+try:
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
+        fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule,
+    )
+    HAS_FLA = True
+except ImportError:
+    HAS_FLA = False
+
 @dataclass
 class Qwen3_5ModelConfig:
     vocab_size: int = 248320
@@ -201,6 +210,24 @@ def l2norm(x, dim=-1, eps=1e-6):
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
 
+def fla_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False):
+    out, state = _fla_chunk_gated_delta_rule(
+        query, key, value, g=g, beta=beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    return out, state
+
+def fla_fused_recurrent_gated_delta_rule(query, key, value, g, beta, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False):
+    out, state = _fla_fused_recurrent_gated_delta_rule(
+        query, key, value, g=g, beta=beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    return out, state
+
 def torch_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False):
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
@@ -325,8 +352,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
 
         self.causal_conv1d_update = torch_causal_conv1d_update
-        self.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-        self.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
+        if HAS_FLA:
+            self.chunk_gated_delta_rule = fla_chunk_gated_delta_rule
+            self.recurrent_gated_delta_rule = fla_fused_recurrent_gated_delta_rule
+        else:
+            self.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+            self.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
+        if layer_idx == 0:
+            backend = "FlashLinearAttention (fla)" if HAS_FLA else "pure PyTorch (fla not installed)"
+            print0(f"Linear attention backend: {backend}")
 
         self.in_proj_qkv = Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
         self.in_proj_z = Linear(self.hidden_size, self.value_dim, bias=False)
@@ -447,7 +481,7 @@ class Qwen3_5Model(nn.Module):
         head_dim = self.config.head_dim
         query_groups = self.config.n_kv_groups
 
-        hs = self.config.hidden_size
+        hs = self.config.emb_dim
         query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
         # --- Standard (full) attention flops per layer ---
         # Qwen3.5 uses gated attention: Q proj outputs 2x (query + gate), applied as sigmoid(gate)*attn
@@ -499,7 +533,7 @@ class Qwen3_5Model(nn.Module):
         # Dense MLP
         layers = self.config.n_layers
         gated_linear_multiplier = 2  # SwiGLU: gate + up projections
-        ffn_hs = self.config.intermediate_size
+        ffn_hs = self.config.hidden_dim
         mlp_flops = 6 * global_batch_size * layers * seq_len * hs * (1 + gated_linear_multiplier) * ffn_hs # calculation of FeedForward (silu is negligible compared to the linear layers)
 
         # --- Vocab flops ---
