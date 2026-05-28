@@ -62,7 +62,12 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
     # Download the eval bundle if needed
     if not os.path.exists(eval_bundle_dir):
-        download_file_with_lock(EVAL_BUNDLE_URL, "eval_bundle.zip", postprocess_fn=place_eval_bundle)
+        print0(f"Eval bundle not found at {eval_bundle_dir}")
+        return {
+            "results": {},
+            "centered_results": {},
+            "core_metric": 0.0
+        }
 
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     data_base_path = os.path.join(eval_bundle_dir, "eval_data")

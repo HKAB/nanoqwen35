@@ -148,12 +148,12 @@ if resuming:
 
 # Gradient checkpointing (must be set before torch.compile)
 if args.gradient_checkpointing:
-    orig_model.enable_gradient_checkpointing()
+    model.enable_gradient_checkpointing()
     print0("✓ Gradient checkpointing enabled (activation memory saved, ~33% extra compute)")
 
 # Logit softcap
 if args.logit_softcap > 0:
-    orig_model.logit_softcap = args.logit_softcap
+    model.logit_softcap = args.logit_softcap
     print0(f"✓ Logit softcap enabled: {args.logit_softcap}")
 
 # -----------------------------------------------------------------------------
@@ -408,8 +408,8 @@ while True:
         prompts = [
             "Một cây làm chẳng nên non,",
             "Thấy Tấm bắt được một giỏ đầy, Cám bảo chị:",
-            "Trăm năm trong cõi người ta,"
-            "Cacbon có 2 hóa trị là"
+            "Trăm năm trong cõi người ta,",
+            "Cacbon có 2 hóa trị là",
             "Vừa gà vừa chó bó lại cho tròn 36 con 100 chân chẵn. Hỏi có bao nhiêu con gà, bao nhiêu con chó?"
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
