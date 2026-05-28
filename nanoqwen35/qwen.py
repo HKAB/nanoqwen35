@@ -443,9 +443,9 @@ class Qwen3_5Model(nn.Module):
 
     def estimate_flops(self, global_batch_size, seq_len):
         # Estimation from: https://docs.nvidia.com/nemo/automodel/0.4.0/_modules/nemo_automodel/components/utils/flops_utils.html#qwen3_5_flops
-        attention_heads = self.config.num_attention_heads
+        attention_heads = self.config.n_heads
         head_dim = self.config.head_dim
-        query_groups = self.config.num_key_value_heads
+        query_groups = self.config.n_kv_groups
 
         hs = self.config.hidden_size
         query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
@@ -453,8 +453,7 @@ class Qwen3_5Model(nn.Module):
         # Qwen3.5 uses gated attention: Q proj outputs 2x (query + gate), applied as sigmoid(gate)*attn
         
         causal_self_attn = True
-        attn_output_gate = self.config.attn_output_gate
-        q_gate_multiplier = 2 if attn_output_gate else 1
+        q_gate_multiplier = 2
         full_attn_per_layer = (
             6
             * global_batch_size
@@ -498,7 +497,7 @@ class Qwen3_5Model(nn.Module):
         attention_flops = full_attn_per_layer * num_full_attn_layers + gdn_attn_per_layer * num_gdn_layers
 
         # Dense MLP
-        layers = self.config.num_hidden_layers
+        layers = self.config.n_layers
         gated_linear_multiplier = 2  # SwiGLU: gate + up projections
         ffn_hs = self.config.intermediate_size
         mlp_flops = 6 * global_batch_size * layers * seq_len * hs * (1 + gated_linear_multiplier) * ffn_hs # calculation of FeedForward (silu is negligible compared to the linear layers)
@@ -507,8 +506,8 @@ class Qwen3_5Model(nn.Module):
         vocab_size = self.config.vocab_size
         vocab_flops = 6 * global_batch_size * seq_len * hs * vocab_size
         # --- MTP flops ---
-        mtp_num_layers = self.config.mtp_num_hidden_layers
-        mtp_flops = 0
+        # mtp_num_layers = self.config.mtp_num_hidden_layers
+        # mtp_flops = 0
         # We didn't implement MTP in this version, but if we did, the main additional cost would be:
         # if mtp_num_layers > 0:
         #     # Embedding projection per MTP layer: 2*hs -> hs
@@ -522,7 +521,7 @@ class Qwen3_5Model(nn.Module):
         #     # Vocab projection per MTP layer
         #     mtp_flops += 6 * global_batch_size * seq_len * hs * vocab_size * mtp_num_layers
 
-        return attention_flops + mlp_flops + vocab_flops + mtp_flops
+        return attention_flops + mlp_flops + vocab_flops
 
         
     def num_scaling_params(self):
