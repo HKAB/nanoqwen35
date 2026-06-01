@@ -183,7 +183,7 @@ def main():
             engine = Engine(model, tokenizer)
             print0("\nConditioned samples:")
             for prompt in prompts:
-                tokens = tokenizer(prompt, prepend=tokenizer.get_bos_token_id())
+                tokens = tokenizer(prompt)
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
                 sample_str = tokenizer.decode(sample[0])
                 print0("-" * 80)
@@ -191,7 +191,7 @@ def main():
                 samples.append(sample_str)
 
             print0("\nUnconditioned samples:")
-            tokens = tokenizer("", prepend=tokenizer.get_bos_token_id())
+            tokens = tokenizer("")
             uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
             for sample in uncond:
                 sample_str = tokenizer.decode(sample)

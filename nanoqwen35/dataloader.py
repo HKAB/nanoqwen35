@@ -1,38 +1,36 @@
 """
 Distributed dataloaders for pretraining.
 
-BOS-aligned bestfit:
-   - Every row starts with BOS token
+Bestfit:
    - Documents packed using best-fit algorithm to minimize cropping
    - When no document fits remaining space, crops a document to fill exactly
-   - 100% utilization (no padding),
-
-Compared to the original tokenizing_distributed_data_loader:
-BOS-aligned loses ~35% of tokens to cropping, but ensures that
-there are fewer "confusing" tokens in the train/val batches as every token can
-now attend back to the BOS token and sees the full context of the document.
-
-Fallback to the original if you have very limited data AND long documents:
-https://github.com/karpathy/nanoqwen35/blob/3c3a3d7/nanoqwen35/dataloader.py#L78-L117
+   - 100% utilization (no padding)
 """
+
+import random
 
 import torch
 import pyarrow.parquet as pq
 
 from nanoqwen35.common import get_dist_info
-from nanoqwen35.dataset import list_parquet_files
+from nanoqwen35.dataset import list_parquet_files, list_parquet_files_by_domain
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size, dataset_path):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, dataset_path, parquet_files=None):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
     Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
     where text_batch is a list of document strings, indices track position for resumption,
     and epoch counts how many times we've cycled through the dataset (starts at 1).
+
+    Pass parquet_files to supply a pre-computed file list (bypasses list_parquet_files/dataset_path).
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    parquet_paths = list_parquet_files(dataset_path)
+    if parquet_files is not None:
+        parquet_paths = parquet_files
+    else:
+        parquet_paths = list_parquet_files(dataset_path)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
@@ -69,96 +67,97 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, dataset_pa
         first_pass = False
         epoch += 1
 
-
-def tokenizing_distributed_data_loader_with_state_bos_bestfit(
-    tokenizer, B, T, split, dataset_path,
+def tokenizing_distributed_data_loader_with_state_weighted(
+    tokenizer, B, T, split,
+    dataset_root,
+    domain_weights=None,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000,
+    buffer_size=100,
 ):
     """
-    BOS-aligned dataloader with Best-Fit Cropping.
+    Multi-domain weighted dataloader with best-fit cropping.
 
-    Reduces token waste compared to simple greedy cropping by searching a buffer
-    for documents that fit well, while maintaining 100% utilization (no padding).
+    Loads parquet files from subdirectories of dataset_root (each subdir = one domain).
+    Each row in the batch is filled entirely from one domain, chosen via weighted random
+    sampling. domain_weights is a {domain_name: float} dict; omit for uniform weights.
 
-    Algorithm for each row:
-    1. From buffered docs, pick the LARGEST doc that fits entirely
-    2. Repeat until no doc fits
-    3. When nothing fits, crop a doc to fill remaining space exactly
+    Resume is approximate: each domain's sequential reader resumes from its saved
+    pq_idx/rg_idx position, but the random domain-sampling order is not replicated.
 
-    Key properties:
-    - Every row starts with BOS
-    - 100% utilization (no padding, every token is trained on)
+    State dict format: {"domain_states": {domain: {"pq_idx": int, "rg_idx": int, "epoch": int}}}
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
+    domain_file_map = list_parquet_files_by_domain(dataset_root)
+    assert domain_file_map, f"No domain subdirectories with parquet files found in {dataset_root}"
+
+    domains = sorted(domain_file_map.keys())
+    weights = [domain_weights.get(d, 1.0) if domain_weights else 1.0 for d in domains]
+
+    saved_domain_states = (resume_state_dict or {}).get("domain_states", {})
+    domain_batches = {
+        d: _document_batches(split, saved_domain_states.get(d), tokenizer_batch_size, dataset_path=None, parquet_files=domain_file_map[d])
+        for d in domains
+    }
+    domain_doc_buffers = {d: [] for d in domains}
+    domain_states = {d: {"pq_idx": 0, "rg_idx": 0, "epoch": 1} for d in domains}
+
+    def refill_domain(d):
+        doc_batch, (pq_idx, rg_idx, epoch) = next(domain_batches[d])
+        domain_states[d] = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+        token_lists = tokenizer.encode(doc_batch, num_threads=tokenizer_threads)
+        domain_doc_buffers[d].extend(token_lists)
+
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, dataset_path=dataset_path)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    pq_idx, rg_idx, epoch = 0, 0, 1
-
-    def refill_buffer():
-        nonlocal pq_idx, rg_idx, epoch
-        doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
-        for tokens in token_lists:
-            doc_buffer.append(tokens)
-
-    # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
-    # This gives us contiguous views and a single HtoD transfer
     use_cuda = device == "cuda"
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
-    cpu_inputs = cpu_buffer[:B * T].view(B, T) # a few views into these buffers just for convenience
+    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
 
     while True:
         for row_idx in range(B):
+            d = random.choices(domains, weights=weights, k=1)[0]
+            buf = domain_doc_buffers[d]
             pos = 0
             while pos < row_capacity:
-                # Ensure buffer has documents
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+                while len(buf) < buffer_size:
+                    refill_domain(d)
 
                 remaining = row_capacity - pos
 
-                # Find largest doc that fits entirely
                 best_idx = -1
                 best_len = 0
-                for i, doc in enumerate(doc_buffer):
+                for i, doc in enumerate(buf):
                     doc_len = len(doc)
                     if doc_len <= remaining and doc_len > best_len:
                         best_idx = i
                         best_len = doc_len
 
                 if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    doc_len = len(doc)
-                    row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
-                    pos += doc_len
+                    doc = buf.pop(best_idx)
+                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
+                    pos += len(doc)
                 else:
-                    # No doc fits - crop shortest in buffer to fill remaining and minimize waste
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
+                    shortest_idx = min(range(len(buf)), key=lambda i: len(buf[i]))
+                    doc = buf.pop(shortest_idx)
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
-        # Copy to pinned CPU buffer, then single HtoD transfer
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
 
-        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+        state_dict = {"domain_states": {d: dict(domain_states[d]) for d in domains}}
 
-        # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         yield inputs, targets, state_dict
 
-def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
+
+def tokenizing_distributed_data_loader_weighted(*args, **kwargs):
     """Helper that omits state_dict from yields."""
-    for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
+    for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_weighted(*args, **kwargs):
         yield inputs, targets

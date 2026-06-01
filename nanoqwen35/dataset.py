@@ -13,3 +13,14 @@ def list_parquet_files(data_dir=None):
     data_dir = DATA_DIR if data_dir is None else data_dir
     files = sorted(f for f in os.listdir(data_dir) if f.endswith('.parquet') and not f.endswith('.tmp'))
     return [os.path.join(data_dir, f) for f in files]
+
+def list_parquet_files_by_domain(root_dir):
+    """Returns {domain_name: [sorted parquet paths]} for each non-empty subdirectory of root_dir."""
+    domains = {}
+    for entry in sorted(os.listdir(root_dir)):
+        subdir = os.path.join(root_dir, entry)
+        if os.path.isdir(subdir):
+            files = sorted(f for f in os.listdir(subdir) if f.endswith('.parquet') and not f.endswith('.tmp'))
+            if files:
+                domains[entry] = [os.path.join(subdir, f) for f in files]
+    return domains

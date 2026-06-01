@@ -27,7 +27,7 @@ import torch._inductor.config as inductor_config
 inductor_config.fx_graph_cache = True  # persist compiled FX graphs to disk
 
 from nanoqwen35.qwen import Qwen3_5Model, Qwen3_5ModelConfig, Linear
-from nanoqwen35.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanoqwen35.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit, tokenizing_distributed_data_loader_with_state_weighted, tokenizing_distributed_data_loader_weighted
 from nanoqwen35.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanoqwen35.tokenizer import get_tokenizer
 from nanoqwen35.checkpoint_manager import save_checkpoint, load_checkpoint, load_pretrained_hf
@@ -82,7 +82,8 @@ parser.add_argument(
     default="./Qwen3.5-0.8B",
     help="path or HF repo id of pretrained model/tokenizer",
 )
-parser.add_argument("--dataset-path", type=str, required=True, help="dataset path that contain parquet files")
+parser.add_argument("--dataset-root", type=str, default=None, help="root folder whose subdirectories are domains (multi-domain mode)", required=True)
+parser.add_argument("--domain-weights", type=str, default=None, help='JSON dict of per-domain weights, e.g. \'{"web": 1.0, "code": 2.0}\' (multi-domain mode only; default: uniform)')
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -330,8 +331,16 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, dataset_path=args.dataset_path)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, dataset_path=args.dataset_path)
+domain_weights = json.loads(args.domain_weights) if args.domain_weights else None
+train_loader = tokenizing_distributed_data_loader_with_state_weighted(
+    tokenizer, args.device_batch_size, args.max_seq_len, split="train",
+    dataset_root=args.dataset_root, domain_weights=domain_weights,
+    device=device, resume_state_dict=dataloader_resume_state_dict,
+)
+build_val_loader = lambda: tokenizing_distributed_data_loader_weighted(
+    tokenizer, args.device_batch_size, args.max_seq_len, split="val",
+    dataset_root=args.dataset_root, device=device,
+)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -414,7 +423,7 @@ while True:
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
-            tokens = tokenizer(prompt, prepend=tokenizer.get_bos_token_id())
+            tokens = tokenizer(prompt)
             with disable_fp8(orig_model):
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
@@ -513,7 +522,10 @@ while True:
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    if "domain_states" in dataloader_state_dict:
+        epoch = " | ".join(f"{d}: ep{s['epoch']} pq{s['pq_idx']}" for d, s in dataloader_state_dict["domain_states"].items())
+    else:
+        epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
