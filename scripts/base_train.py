@@ -17,7 +17,6 @@ import json
 import time
 import math
 import argparse
-from dataclasses import asdict
 from contextlib import contextmanager
 
 import wandb
@@ -26,8 +25,8 @@ import torch.distributed as dist
 import torch._inductor.config as inductor_config
 inductor_config.fx_graph_cache = True  # persist compiled FX graphs to disk
 
-from nanoqwen35.qwen import Qwen3_5Model, Qwen3_5ModelConfig, Linear
-from nanoqwen35.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit, tokenizing_distributed_data_loader_with_state_weighted, tokenizing_distributed_data_loader_weighted
+from nanoqwen35.qwen import Linear
+from nanoqwen35.dataloader import tokenizing_distributed_data_loader_with_state_weighted, tokenizing_distributed_data_loader_weighted
 from nanoqwen35.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanoqwen35.tokenizer import get_tokenizer
 from nanoqwen35.checkpoint_manager import save_checkpoint, load_checkpoint, load_pretrained_hf

@@ -26,20 +26,16 @@ import random
 import zipfile
 import tempfile
 import argparse
-import torch
 
-from nanoqwen35.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
+from nanoqwen35.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type
 from nanoqwen35.checkpoint_manager import load_pretrained_hf
 from nanoqwen35.core_eval import evaluate_task
-from nanoqwen35.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanoqwen35.dataloader import tokenizing_distributed_data_loader_weighted
 from nanoqwen35.loss_eval import evaluate_loss
 from nanoqwen35.engine import Engine
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
-
-EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
-
 
 def place_eval_bundle(file_path):
     """Unzip eval_bundle.zip and place it in the base directory."""
@@ -210,11 +206,10 @@ def main():
             print0(f"Adjusted split_tokens to {args.split_tokens} (must be divisible by {tokens_per_step})")
         steps = args.split_tokens // tokens_per_step
 
-        for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
-            loss = evaluate_loss(model, loader, steps)
-            loss_results[split_name] = loss
-            print0(f"{split_name} loss: {loss:.6f}")
+        loader = tokenizing_distributed_data_loader_weighted(tokenizer, args.device_batch_size, sequence_len, "val", device=device)
+        loss = evaluate_loss(model, loader, steps)
+        loss_results["val"] = loss
+        print0(f"Val loss: {loss:.6f}")
 
     # --- CORE evaluation ---
     if 'core' in eval_modes:

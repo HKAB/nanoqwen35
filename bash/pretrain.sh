@@ -1,26 +1,3 @@
-# ~ 50B tokens
-python -m scripts.base_train \
-                            --pretrained-model-path /mnt/data/users/truongnp5/cache/hub/models--Qwen--Qwen3.5-0.8B-Base/snapshots/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68 \
-                            --dataset-path /mnt/data/users/truongnp5/final_clean_data/vi_en_clean_dataset_v1 \
-                            --max-seq-len 4096 \
-                            --num-iterations 1000 \
-                            --device-batch-size 4 \
-                            --total-batch-size 131072 \
-                            --embedding-lr 1e-5 \
-                            --unembedding-lr 1e-5 \
-                            --matrix-lr 1e-5 \
-                            --scalar-lr 1e-5 \
-                            --warmdown-ratio 0.1 \
-                            --optimizer muon \
-                            --weight-decay 0.1 \
-                            --final-lr-frac 0.1 \
-                            --eval-every 1000 \
-                            --eval-tokens 131072 \
-                            --core-metric-every 50 \
-                            --core-metric-max-per-task 500 \
-                            --sample-every 20 \
-                            --save-every 1000
-
 # Training with weighting
 # {
 #     "math_coding": 0.15, # 	942,341,016 + 391,859,673 + 420,501,058
@@ -35,25 +12,26 @@ python -m scripts.base_train \
 #     "politic_sensitive": 0.03, # 1,249,071
 #     "driver_license_cert": 0.005 # 123,007
 # }
-# python -m scripts.base_train \
-#     --pretrained-model-path /mnt/data/users/truongnp5/cache/hub/models--Qwen--Qwen3.5-0.8B-Base/snapshots/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68 \
-#     --dataset-root /mnt/data/users/truongnp5/final_clean_data/vi_en_high_quality_dataset_v1 \
-#     --domain-weights {"math_coding": 0.15, "fineweb2-vi-edu": 0.15, "fineweb-edu": 0.1, "vi_wiki": 0.15, "vigpt": 0.07, "vietnamese_curated_dataset": 0.05, "ocr": 0.07, "law": 0.05, "book": 0.09, "vietjack": 0.03, "finepdfs-edu-vie": 0.05, "politic_sensitive": 0.03, "driver_license_cert": 0.01} \
-#     --max-seq-len 4096 \
-#     --num-iterations 14200 \
-#     --device-batch-size 16 \
-#     --total-batch-size 2097152 \
-#     --embedding-lr 5e-5 \
-#     --unembedding-lr 5e-5 \
-#     --matrix-lr 5e-5 \
-#     --scalar-lr 5e-5 \
-#     --warmdown-ratio 0.1 \
-#     --optimizer muon \
-#     --weight-decay 0.1 \
-#     --final-lr-frac 0.1 \
-#     --eval-every 1000 \
-#     --eval-tokens 1048576 \
-#     --core-metric-every 1000 \
-#     --core-metric-max-per-task 500 \
-#     --sample-every 1000 \
-#     --save-every 1000
+python -m scripts.base_train \
+    --pretrained-model-path /mnt/data/huggingface/hub/models--Qwen--Qwen3.5-0.8B-Base/snapshots/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68 \
+    --dataset-root /mnt/data/users/truongnp5/final_clean_data/vi_en_parquet_v1 \
+    --domain-weights '{"math_coding": 0.15, "fineweb2-vi-edu": 0.15, "fineweb-edu": 0.1, "vi_wiki": 0.15, "vigpt": 0.07, "vietnamese_curated_dataset": 0.05, "ocr": 0.07, "law": 0.05, "book": 0.09, "vietjack": 0.03, "finepdfs-edu-vie": 0.05, "politic_sensitive": 0.03, "driver_license_cert": 0.01}' \
+    --max-seq-len 4096 \
+    --num-iterations 14200 \
+    --device-batch-size 8 \
+    --gradient-checkpointing \
+    --total-batch-size 131072 \
+    --embedding-lr 5e-5 \
+    --unembedding-lr 5e-5 \
+    --matrix-lr 5e-5 \
+    --scalar-lr 5e-5 \
+    --warmdown-ratio 0.1 \
+    --optimizer muon \
+    --weight-decay 0.1 \
+    --final-lr-frac 0.1 \
+    --eval-every 1000 \
+    --eval-tokens 131072 \
+    --core-metric-every 1000 \
+    --core-metric-max-per-task 500 \
+    --sample-every 1000 \
+    --save-every 1000

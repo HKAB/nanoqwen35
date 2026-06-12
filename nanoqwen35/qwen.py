@@ -55,15 +55,12 @@ class Linear(nn.Linear):
 class FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.fc1 = Linear(cfg.emb_dim, cfg.hidden_dim, bias=False)
-        self.fc2 = Linear(cfg.emb_dim, cfg.hidden_dim, bias=False)
-        self.fc3 = Linear(cfg.hidden_dim, cfg.emb_dim, bias=False)
+        self.gate_proj = Linear(cfg.emb_dim, cfg.hidden_dim, bias=False)
+        self.up_proj = Linear(cfg.emb_dim, cfg.hidden_dim, bias=False)
+        self.down_proj = Linear(cfg.hidden_dim, cfg.emb_dim, bias=False)
 
     def forward(self, x):
-        x_fc1 = self.fc1(x)
-        x_fc2 = self.fc2(x)
-        x = F.silu(x_fc1) * x_fc2 # O(N) ops
-        return self.fc3(x)
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 class RMSNorm(nn.Module):
     def __init__(self, emb_dim, eps=1e-6):
@@ -132,11 +129,11 @@ class GroupedQueryAttention(nn.Module):
         self.d_out = self.num_heads * self.head_dim
         self.layer_idx = layer_idx
 
-        # In Qwen3.5 full attention, W_query outputs d_out * 2 because of the context gate
-        self.W_query = Linear(self.d_in, self.d_out * 2, bias=False)
-        self.W_key = Linear(self.d_in, self.num_kv_groups * self.head_dim, bias=False)
-        self.W_value = Linear(self.d_in, self.num_kv_groups * self.head_dim, bias=False)
-        self.out_proj = Linear(self.d_out, self.d_in, bias=False)
+        # In Qwen3.5 full attention, q_proj outputs d_out * 2 because of the context gate
+        self.q_proj = Linear(self.d_in, self.d_out * 2, bias=False)
+        self.k_proj = Linear(self.d_in, self.num_kv_groups * self.head_dim, bias=False)
+        self.v_proj = Linear(self.d_in, self.num_kv_groups * self.head_dim, bias=False)
+        self.o_proj = Linear(self.d_out, self.d_in, bias=False)
 
         if cfg.qk_norm:
             self.q_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
@@ -148,13 +145,13 @@ class GroupedQueryAttention(nn.Module):
     def forward(self, x, mask, cos, sin, start_pos=0, cache=None):
         b, num_tokens, _ = x.shape
 
-        q_and_gate = self.W_query(x)
+        q_and_gate = self.q_proj(x)
         q_and_gate = q_and_gate.view(b, num_tokens, self.num_heads, 2 * self.head_dim)
         queries, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(b, num_tokens, self.d_out)
 
-        keys = self.W_key(x)
-        values = self.W_value(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
 
         queries = queries.transpose(1, 2)  # (b, num_heads, num_tokens, head_dim)
         keys_new = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
@@ -194,7 +191,7 @@ class GroupedQueryAttention(nn.Module):
 
         context = context.contiguous().reshape(b, num_tokens, self.d_out)
         context = context * torch.sigmoid(gate)
-        out = self.out_proj(context)
+        out = self.o_proj(context)
         return out, next_cache
 
 def torch_causal_conv1d_update(hidden_states, conv_state, weight, bias=None, activation=None):
@@ -427,25 +424,26 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.layer_type = layer_type
         if layer_type == "full_attention":
-            self.token_mixer = GroupedQueryAttention(cfg, layer_idx)
+            self.self_attn = GroupedQueryAttention(cfg, layer_idx)
         elif layer_type == "linear_attention":
-            self.token_mixer = Qwen3_5GatedDeltaNet(cfg, layer_idx)
+            self.linear_attn = Qwen3_5GatedDeltaNet(cfg, layer_idx)
         else:
             raise ValueError(f"Unsupported layer type: {layer_type}")
-        
-        self.ff = FeedForward(cfg)
-        self.norm1 = RMSNorm(cfg.emb_dim, eps=cfg.rms_norm_eps)
-        self.norm2 = RMSNorm(cfg.emb_dim, eps=cfg.rms_norm_eps)
+
+        self.mlp = FeedForward(cfg)
+        self.input_layernorm = RMSNorm(cfg.emb_dim, eps=cfg.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(cfg.emb_dim, eps=cfg.rms_norm_eps)
 
     def forward(self, x, mask, cos, sin, start_pos=0, cache=None):
         shortcut = x
-        x = self.norm1(x)
-        x, next_cache = self.token_mixer(x, mask=mask, cos=cos, sin=sin, start_pos=start_pos, cache=cache)
+        x = self.input_layernorm(x)
+        token_mixer = self.self_attn if self.layer_type == "full_attention" else self.linear_attn
+        x, next_cache = token_mixer(x, mask=mask, cos=cos, sin=sin, start_pos=start_pos, cache=cache)
         x = x + shortcut
 
         shortcut = x
-        x = self.norm2(x)
-        x = self.ff(x)
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
         x = x + shortcut
         return x, next_cache
 

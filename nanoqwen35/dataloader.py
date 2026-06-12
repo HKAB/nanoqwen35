@@ -32,7 +32,12 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, dataset_pa
     else:
         parquet_paths = list_parquet_files(dataset_path)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
-    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+
+    if split == "train":
+        parquet_paths = [p for p in parquet_paths if "train" in p]
+    else:
+        parquet_paths = [p for p in parquet_paths if "val" in p]
+    assert len(parquet_paths) != 0, f"No parquet files found for split '{split}'"
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None

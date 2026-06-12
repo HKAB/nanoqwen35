@@ -168,46 +168,20 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     hf_state_dict = {}
     for st_file in st_files:
         hf_state_dict.update(load_file(st_file, device=str(device)))
-        
-    state_dict = {}
-    state_dict["transformer.wte.weight"] = hf_state_dict["model.language_model.embed_tokens.weight"]
-    if "lm_head.weight" in hf_state_dict:
-        state_dict["lm_head.weight"] = hf_state_dict["lm_head.weight"]
-    elif hf_config.get("tie_word_embeddings", False) or hf_config.get("text_config", {}).get("tie_word_embeddings", False):
-        state_dict["lm_head.weight"] = hf_state_dict["model.language_model.embed_tokens.weight"]
-        
-    state_dict["final_norm.weight"] = hf_state_dict["model.language_model.norm.weight"]
-    
-    for i in range(model_config.n_layers):
-        prefix = f"transformer.h.{i}."
-        hf_prefix = f"model.language_model.layers.{i}."
-        
-        state_dict[prefix + "norm1.weight"] = hf_state_dict[hf_prefix + "input_layernorm.weight"]
-        state_dict[prefix + "norm2.weight"] = hf_state_dict[hf_prefix + "post_attention_layernorm.weight"]
-        
-        state_dict[prefix + "ff.fc3.weight"] = hf_state_dict[hf_prefix + "mlp.down_proj.weight"]
-        state_dict[prefix + "ff.fc1.weight"] = hf_state_dict[hf_prefix + "mlp.gate_proj.weight"]
-        state_dict[prefix + "ff.fc2.weight"] = hf_state_dict[hf_prefix + "mlp.up_proj.weight"]
-        
-        ltype = model_config.layer_types[i]
-        if ltype == "full_attention":
-            state_dict[prefix + "token_mixer.W_query.weight"] = hf_state_dict[hf_prefix + "self_attn.q_proj.weight"]
-            state_dict[prefix + "token_mixer.W_key.weight"] = hf_state_dict[hf_prefix + "self_attn.k_proj.weight"]
-            state_dict[prefix + "token_mixer.W_value.weight"] = hf_state_dict[hf_prefix + "self_attn.v_proj.weight"]
-            state_dict[prefix + "token_mixer.out_proj.weight"] = hf_state_dict[hf_prefix + "self_attn.o_proj.weight"]
-            state_dict[prefix + "token_mixer.q_norm.weight"] = hf_state_dict[hf_prefix + "self_attn.q_norm.weight"]
-            state_dict[prefix + "token_mixer.k_norm.weight"] = hf_state_dict[hf_prefix + "self_attn.k_norm.weight"]
-        elif ltype == "linear_attention":
-            state_dict[prefix + "token_mixer.in_proj_qkv.weight"] = hf_state_dict[hf_prefix + "linear_attn.in_proj_qkv.weight"]
-            state_dict[prefix + "token_mixer.in_proj_z.weight"] = hf_state_dict[hf_prefix + "linear_attn.in_proj_z.weight"]
-            state_dict[prefix + "token_mixer.in_proj_b.weight"] = hf_state_dict[hf_prefix + "linear_attn.in_proj_b.weight"]
-            state_dict[prefix + "token_mixer.in_proj_a.weight"] = hf_state_dict[hf_prefix + "linear_attn.in_proj_a.weight"]
-            state_dict[prefix + "token_mixer.out_proj.weight"] = hf_state_dict[hf_prefix + "linear_attn.out_proj.weight"]
-            state_dict[prefix + "token_mixer.conv1d.weight"] = hf_state_dict[hf_prefix + "linear_attn.conv1d.weight"]
-            state_dict[prefix + "token_mixer.norm.weight"] = hf_state_dict[hf_prefix + "linear_attn.norm.weight"]
-            state_dict[prefix + "token_mixer.A_log"] = hf_state_dict[hf_prefix + "linear_attn.A_log"]
-            state_dict[prefix + "token_mixer.dt_bias"] = hf_state_dict[hf_prefix + "linear_attn.dt_bias"]
-            
+
+    def hf_to_nano_key(k):
+        k = k.replace("model.language_model.embed_tokens.", "transformer.wte.")
+        k = k.replace("model.language_model.norm.", "final_norm.")
+        k = re.sub(r"model\.language_model\.layers\.(\d+)\.", r"transformer.h.\1.", k)
+        return k
+
+    state_dict = {hf_to_nano_key(k): v for k, v in hf_state_dict.items()}
+
+    if "lm_head.weight" not in state_dict:
+        tie = hf_config.get("tie_word_embeddings", False) or hf_config.get("text_config", {}).get("tie_word_embeddings", False)
+        if tie:
+            state_dict["lm_head.weight"] = state_dict["transformer.wte.weight"]
+
     model.load_state_dict(state_dict, strict=True, assign=True)
     if phase == "eval":
         model.eval()
