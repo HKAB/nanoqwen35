@@ -41,6 +41,12 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb-project", type=str, default="nanoqwen35", help="wandb project name")
+parser.add_argument("--wandb-entity", type=str, default=None, help="wandb entity/team name (leave blank for personal account)")
+parser.add_argument("--wandb-id", type=str, default=None, help="wandb run ID — pass the previous run ID with --resume-from-step to continue the same dashboard run")
+parser.add_argument("--wandb-tags", type=str, default=None, help="comma-separated tags, e.g. '0.8B,pretrain,fp8'")
+parser.add_argument("--wandb-notes", type=str, default=None, help="free-text notes attached to this wandb run")
+parser.add_argument("--wandb-watch", action="store_true", help="log gradient/weight histograms via wandb.watch() — adds overhead, use for debugging")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -104,7 +110,23 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanoqwen35", name=args.run, config=user_config)
+if use_dummy_wandb:
+    wandb_run = DummyWandb()
+else:
+    tags = [t.strip() for t in args.wandb_tags.split(",")] if args.wandb_tags else None
+    wandb_run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        id=args.wandb_id,
+        name=args.run,
+        config=user_config,
+        tags=tags,
+        notes=args.wandb_notes,
+        resume="allow",  # safe no-op when id=None; resumes the run when id is provided
+    )
+    # Use "step" as the primary x-axis for every metric panel
+    wandb.define_metric("step")
+    wandb.define_metric("*", step_metric="step")
 
 # Flash Attention status
 from nanoqwen35.flash_attention import USE_FA3
@@ -243,6 +265,9 @@ if args.no_compile:
     print0("torch.compile disabled (--no-compile flag set)")
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.wandb_watch and not use_dummy_wandb:
+    wandb.watch(orig_model, log="gradients", log_freq=100, log_graph=False)
+    print0("✓ wandb.watch() enabled: gradient histograms will be logged every 100 steps")
 
 # -----------------------------------------------------------------------------
 # Manual training setup for continued pretraining (no scaling-law auto-tuning)
@@ -373,6 +398,23 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# -----------------------------------------------------------------------------
+# Pre-training kernel warmup
+# FLA/tilelang JIT kernels are compiled lazily on first use and can take >10 min.
+# Running a forward+backward warmup on all ranks before any NCCL collective is
+# launched prevents NCCL timeout from hitting the default 10-minute limit.
+if ddp and device_type == "cuda":
+    print0("Pre-training warmup: compiling kernels on all ranks (forward + backward)...")
+    model.train()
+    _wx = torch.zeros((args.device_batch_size, args.max_seq_len), dtype=torch.long, device=device)
+    _wy = torch.zeros((args.device_batch_size, args.max_seq_len), dtype=torch.long, device=device)
+    _wl = model(_wx, _wy)   # compile forward (and torch.compile graph)
+    _wl.backward()          # compile backward (triggers FLA chunk_bwd/tilelang kernels)
+    model.zero_grad(set_to_none=True)
+    del _wx, _wy, _wl
+    dist.barrier()  # wait for ALL ranks to finish compilation before any NCCL collective
+    print0("Kernel warmup complete — all ranks synchronized.")
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -487,7 +529,7 @@ while True:
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
         # the found_inf flag (MAX = if any rank found inf, all ranks skip).
@@ -497,7 +539,7 @@ while True:
         scaler.step(optimizer)
         scaler.update()
     else:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
         optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
@@ -531,16 +573,20 @@ while True:
         epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
+        lr_log = {f"train/lr_{g['kind']}": g["lr"] for g in optimizer.param_groups}
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
             "train/lrm": lrm,
+            "train/grad_norm": grad_norm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "system/gpu_memory_mb": get_max_memory() / 1024 / 1024,
+            **lr_log,
         }
         wandb_run.log(log_data)
 

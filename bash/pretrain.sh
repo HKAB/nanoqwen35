@@ -12,14 +12,23 @@
 #     "politic_sensitive": 0.03, # 1,249,071
 #     "driver_license_cert": 0.005 # 123,007
 # }
-python -m scripts.base_train \
+export WANDB_MODE=offline
+# export NCCL_TIMEOUT=7200                          # 2 hours in seconds
+# export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200      # match heartbeat timeout
+
+torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.base_train -- \
+    --run qwen_0.8B \
+    --wandb-project nanoqwen35 \
+    --wandb-entity hkab \
+    --wandb-tags "0.8B,pretrain" \
     --pretrained-model-path /mnt/data/huggingface/hub/models--Qwen--Qwen3.5-0.8B-Base/snapshots/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68 \
     --dataset-root /mnt/data/users/truongnp5/final_clean_data/vi_en_parquet_v1 \
     --domain-weights '{"math_coding": 0.15, "fineweb2-vi-edu": 0.15, "fineweb-edu": 0.1, "vi_wiki": 0.15, "vigpt": 0.07, "vietnamese_curated_dataset": 0.05, "ocr": 0.07, "law": 0.05, "book": 0.09, "vietjack": 0.03, "finepdfs-edu-vie": 0.05, "politic_sensitive": 0.03, "driver_license_cert": 0.01}' \
     --max-seq-len 4096 \
     --num-iterations 14200 \
-    --device-batch-size 8 \
+    --device-batch-size 4 \
     --gradient-checkpointing \
+    --no-compile \
     --total-batch-size 131072 \
     --embedding-lr 5e-5 \
     --unembedding-lr 5e-5 \

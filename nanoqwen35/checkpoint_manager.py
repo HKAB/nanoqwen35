@@ -182,6 +182,14 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
         if tie:
             state_dict["lm_head.weight"] = state_dict["transformer.wte.weight"]
 
+    # Filter out keys not present in the model (e.g. visual encoder and MTP heads
+    # from multimodal checkpoints that are not part of the text-only Qwen3_5Model).
+    expected_keys = set(model.state_dict().keys())
+    unexpected_keys = set(state_dict.keys()) - expected_keys
+    if unexpected_keys:
+        log0(f"Ignoring {len(unexpected_keys)} unexpected keys from HF checkpoint (e.g. model.visual.*, mtp.*)")
+    state_dict = {k: v for k, v in state_dict.items() if k in expected_keys}
+
     model.load_state_dict(state_dict, strict=True, assign=True)
     if phase == "eval":
         model.eval()
