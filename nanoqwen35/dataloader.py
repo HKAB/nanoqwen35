@@ -7,8 +7,10 @@ Bestfit:
    - 100% utilization (no padding)
 """
 
+import os
 import random
 
+import numpy as np
 import torch
 import pyarrow.parquet as pq
 
@@ -203,4 +205,168 @@ def tokenizing_distributed_data_loader_with_state_weighted(
 def tokenizing_distributed_data_loader_weighted(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_weighted(*args, **kwargs):
+        yield inputs, targets
+
+
+# ---------------------------------------------------------------------------
+# Pre-tokenized dataloader (zero runtime tokenization overhead)
+# ---------------------------------------------------------------------------
+
+def _packed_row_batches(split, resume_state_dict, parquet_files):
+    """
+    Infinite iterator over pre-packed rows from pretokenized parquet files.
+
+    Structural twin of _document_batches with identical file-sharding logic and
+    identical state-dict encoding.  Each yield is (row_np, (pq_idx, rg_idx, epoch))
+    where row_np is a np.int32 array of shape (T+1,).
+    """
+    _, ddp_rank, _, ddp_world_size = get_dist_info()
+
+    parquet_paths = list(parquet_files)
+    assert len(parquet_paths) != 0, "No pretokenized parquet files found"
+
+    if split == "train":
+        parquet_paths = [p for p in parquet_paths if "train" in os.path.basename(p)]
+    else:
+        parquet_paths = [p for p in parquet_paths if "val" in os.path.basename(p)]
+    assert len(parquet_paths) != 0, f"No parquet files found for split '{split}'"
+
+    # File-level sharding (same logic as _document_batches)
+    file_sharding = len(parquet_paths) >= ddp_world_size
+    if file_sharding:
+        parquet_paths = parquet_paths[ddp_rank::ddp_world_size]
+
+    raw_resume_pq = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
+    resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
+    resume_epoch  = resume_state_dict.get("epoch", 1) if resume_state_dict is not None else 1
+    resume_pq_idx = raw_resume_pq // ddp_world_size if file_sharding else raw_resume_pq
+
+    first_pass = True
+    epoch = resume_epoch
+
+    while True:
+        start_pq = resume_pq_idx if first_pass else 0
+        for local_pq_idx in range(start_pq, len(parquet_paths)):
+            global_pq_idx = local_pq_idx * ddp_world_size + ddp_rank if file_sharding else local_pq_idx
+            pf = pq.ParquetFile(parquet_paths[local_pq_idx])
+
+            if file_sharding:
+                start_rg = 0
+                if first_pass and resume_rg_idx is not None and local_pq_idx == start_pq:
+                    start_rg = resume_rg_idx + 1
+                    resume_rg_idx = None
+                for rg_idx in range(start_rg, pf.num_row_groups):
+                    col = pf.read_row_group(rg_idx, columns=["input_ids"]).column("input_ids")
+                    c = col.combine_chunks() if col.num_chunks > 1 else col.chunks[0]
+                    flat_np = c.values.to_numpy(zero_copy_only=False)
+                    rows_np = flat_np.reshape(len(c), -1)
+                    for row_i in range(len(rows_np)):
+                        yield rows_np[row_i], (global_pq_idx, rg_idx, epoch)
+            else:
+                # Row-group sharding fallback (identical to _document_batches)
+                if first_pass and resume_rg_idx is not None and local_pq_idx == start_pq:
+                    base_idx = resume_rg_idx // ddp_world_size
+                    base_idx += 1
+                    rg_idx = base_idx * ddp_world_size + ddp_rank
+                    if rg_idx >= pf.num_row_groups:
+                        continue
+                    resume_rg_idx = None
+                else:
+                    rg_idx = ddp_rank
+                while rg_idx < pf.num_row_groups:
+                    col = pf.read_row_group(rg_idx, columns=["input_ids"]).column("input_ids")
+                    c = col.combine_chunks() if col.num_chunks > 1 else col.chunks[0]
+                    flat_np = c.values.to_numpy(zero_copy_only=False)
+                    rows_np = flat_np.reshape(len(c), -1)
+                    for row_i in range(len(rows_np)):
+                        yield rows_np[row_i], (global_pq_idx, rg_idx, epoch)
+                    rg_idx += ddp_world_size
+
+        first_pass = False
+        epoch += 1
+
+
+def packed_distributed_data_loader_with_state_weighted(
+    B, T, split,
+    dataset_root,
+    domain_weights=None,
+    device="cuda",
+    resume_state_dict=None,
+):
+    """
+    Multi-domain weighted dataloader for pre-tokenized parquet files.
+
+    Drop-in replacement for tokenizing_distributed_data_loader_with_state_weighted.
+    No tokenizer argument — reads pre-packed T+1 token sequences directly from disk.
+    Zero runtime tokenization, zero best-fit packing search.
+
+    State dict format is identical to the text-based loader for checkpoint compatibility.
+    """
+    assert split in ["train", "val"], "split must be 'train' or 'val'"
+
+    from nanoqwen35.dataset import list_parquet_files_by_domain, get_pretokenize_metadata
+
+    meta = get_pretokenize_metadata(dataset_root)
+    assert meta is not None, (
+        f"pretokenize_metadata.json not found in {dataset_root}. "
+        "Run: python -m scripts.pretokenize --source-root ... --output-root ... --T ..."
+    )
+    assert meta["T"] == T, (
+        f"Sequence length mismatch: dataset was pretokenized at T={meta['T']} "
+        f"but training uses T={T}. "
+        f"Re-run: python -m scripts.pretokenize --T {T} --source-root ... --output-root ..."
+    )
+
+    domain_file_map = list_parquet_files_by_domain(dataset_root)
+    assert domain_file_map, f"No domain subdirectories with parquet files found in {dataset_root}"
+
+    domains = sorted(domain_file_map.keys())
+    weights = [domain_weights.get(d, 1.0) if domain_weights else 1.0 for d in domains]
+
+    # Log sharding mode per domain
+    _, _, _, ddp_world_size = get_dist_info()
+    for d in domains:
+        train_files = [f for f in domain_file_map[d] if "train" in os.path.basename(f)]
+        mode = (
+            "file-sharding"
+            if len(train_files) >= ddp_world_size
+            else f"row-group-fallback ({len(train_files)} files < {ddp_world_size} ranks)"
+        )
+        print0(f"  Dataloader domain '{d}': {len(train_files)} train files → {mode}")
+
+    saved_domain_states = (resume_state_dict or {}).get("domain_states", {})
+    domain_row_iters = {
+        d: _packed_row_batches(split, saved_domain_states.get(d), domain_file_map[d])
+        for d in domains
+    }
+    domain_states = {d: {"pq_idx": 0, "rg_idx": 0, "epoch": 1} for d in domains}
+
+    row_buffer = np.empty((B, T + 1), dtype=np.int32)
+    use_cuda   = device == "cuda"
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[: B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T :].view(B, T)
+    inputs  = gpu_buffer[: B * T].view(B, T)
+    targets = gpu_buffer[B * T :].view(B, T)
+
+    while True:
+        for row_idx in range(B):
+            d = random.choices(domains, weights=weights, k=1)[0]
+            row_np, (pq_idx, rg_idx, epoch) = next(domain_row_iters[d])
+            domain_states[d] = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+            row_buffer[row_idx] = row_np
+
+        cpu_inputs.copy_(torch.from_numpy(row_buffer[:, :-1]).long())
+        cpu_targets.copy_(torch.from_numpy(row_buffer[:, 1:]).long())
+
+        state_dict = {"domain_states": {d: dict(domain_states[d]) for d in domains}}
+
+        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        yield inputs, targets, state_dict
+
+
+def packed_distributed_data_loader_weighted(*args, **kwargs):
+    """Helper that omits state_dict from yields."""
+    for inputs, targets, _ in packed_distributed_data_loader_with_state_weighted(*args, **kwargs):
         yield inputs, targets

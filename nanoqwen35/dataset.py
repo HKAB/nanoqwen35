@@ -24,3 +24,13 @@ def list_parquet_files_by_domain(root_dir):
             if files:
                 domains[entry] = [os.path.join(subdir, f) for f in files]
     return domains
+
+
+def get_pretokenize_metadata(dataset_root: str):
+    """Returns parsed pretokenize_metadata.json from dataset_root, or None if not found."""
+    import json
+    meta_path = os.path.join(dataset_root, "pretokenize_metadata.json")
+    if not os.path.exists(meta_path):
+        return None
+    with open(meta_path) as f:
+        return json.load(f)

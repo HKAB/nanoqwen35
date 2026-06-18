@@ -26,7 +26,13 @@ import torch._inductor.config as inductor_config
 inductor_config.fx_graph_cache = True  # persist compiled FX graphs to disk
 
 from nanoqwen35.qwen import Linear
-from nanoqwen35.dataloader import tokenizing_distributed_data_loader_with_state_weighted, tokenizing_distributed_data_loader_weighted
+from nanoqwen35.dataloader import (
+    tokenizing_distributed_data_loader_with_state_weighted,
+    tokenizing_distributed_data_loader_weighted,
+    packed_distributed_data_loader_with_state_weighted,
+    packed_distributed_data_loader_weighted,
+)
+from nanoqwen35.dataset import get_pretokenize_metadata
 from nanoqwen35.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanoqwen35.tokenizer import get_tokenizer
 from nanoqwen35.checkpoint_manager import save_checkpoint, load_checkpoint, load_pretrained_hf
@@ -360,15 +366,28 @@ if scaler is not None:
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 domain_weights = json.loads(args.domain_weights) if args.domain_weights else None
-train_loader = tokenizing_distributed_data_loader_with_state_weighted(
-    tokenizer, args.device_batch_size, args.max_seq_len, split="train",
-    dataset_root=args.dataset_root, domain_weights=domain_weights,
-    device=device, resume_state_dict=dataloader_resume_state_dict,
-)
-build_val_loader = lambda: tokenizing_distributed_data_loader_weighted(
-    tokenizer, args.device_batch_size, args.max_seq_len, split="val",
-    dataset_root=args.dataset_root, device=device,
-)
+_pretok_meta = get_pretokenize_metadata(args.dataset_root)
+if _pretok_meta is not None:
+    print0(f"Pretokenized dataset detected (T={_pretok_meta['T']}) — using packed dataloader (zero runtime tokenization)")
+    train_loader = packed_distributed_data_loader_with_state_weighted(
+        args.device_batch_size, args.max_seq_len, split="train",
+        dataset_root=args.dataset_root, domain_weights=domain_weights,
+        device=device, resume_state_dict=dataloader_resume_state_dict,
+    )
+    build_val_loader = lambda: packed_distributed_data_loader_weighted(
+        args.device_batch_size, args.max_seq_len, split="val",
+        dataset_root=args.dataset_root, device=device,
+    )
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_weighted(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="train",
+        dataset_root=args.dataset_root, domain_weights=domain_weights,
+        device=device, resume_state_dict=dataloader_resume_state_dict,
+    )
+    build_val_loader = lambda: tokenizing_distributed_data_loader_weighted(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="val",
+        dataset_root=args.dataset_root, device=device,
+    )
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
