@@ -1,20 +1,9 @@
-# Training with weighting
-# {
-#     "math_coding": 0.15, # 	942,341,016 + 391,859,673 + 420,501,058
-#     "fineweb2-vi-edu": 0.15, # 7,147,560,008
-#     "fineweb-edu": 0.1, # 15,143,783,278
-#     "vi_wiki": 0.15, # 499,762,832
-#     "vigpt": 0.07, # 16,566,012,949
-#     "vietnamese_curated_dataset": 0.05, # 10,324,888,638
-#     "ocr": 0.07, "law": 0.05, "book": 0.09, # 1,271,336,637
-#     "vietjack": 0.03, # ~100,000,000
-#     "finepdfs-edu-vie": 0.055, # ~100,000,000
-#     "politic_sensitive": 0.03, # 1,249,071
-#     "driver_license_cert": 0.005 # 123,007
-# }
+# Pre-training with merged flat dataset.
+# Pipeline: raw parquet → pretokenize_and_merge.sh → this script.
+
 export WANDB_MODE=offline
-# export NCCL_TIMEOUT=7200                          # 2 hours in seconds
-# export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200      # match heartbeat timeout
+# export NCCL_TIMEOUT=7200
+# export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200
 
 torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.base_train -- \
     --run qwen_0.8B \
@@ -22,8 +11,7 @@ torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.base_train -- 
     --wandb-entity hkab \
     --wandb-tags "0.8B,pretrain" \
     --pretrained-model-path /mnt/data/huggingface/hub/models--Qwen--Qwen3.5-0.8B-Base/snapshots/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68 \
-    --dataset-root /mnt/data/users/truongnp5/final_clean_data/vi_en_parquet_v1 \
-    --domain-weights '{"math_coding": 0.15, "fineweb2-vi-edu": 0.15, "fineweb-edu": 0.1, "vi_wiki": 0.15, "vigpt": 0.07, "vietnamese_curated_dataset": 0.05, "ocr": 0.07, "law": 0.05, "book": 0.09, "vietjack": 0.03, "finepdfs-edu-vie": 0.05, "politic_sensitive": 0.03, "driver_license_cert": 0.01}' \
+    --dataset-root /mnt/data/users/truongnp5/final_clean_data/vi_en_merged_v1 \
     --max-seq-len 4096 \
     --num-iterations 14200 \
     --device-batch-size 4 \

@@ -27,12 +27,9 @@ inductor_config.fx_graph_cache = True  # persist compiled FX graphs to disk
 
 from nanoqwen35.qwen import Linear
 from nanoqwen35.dataloader import (
-    tokenizing_distributed_data_loader_with_state_weighted,
-    tokenizing_distributed_data_loader_weighted,
-    packed_distributed_data_loader_with_state_weighted,
-    packed_distributed_data_loader_weighted,
+    pretrain_loader_with_state,
+    pretrain_loader,
 )
-from nanoqwen35.dataset import get_pretokenize_metadata
 from nanoqwen35.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanoqwen35.tokenizer import get_tokenizer
 from nanoqwen35.checkpoint_manager import save_checkpoint, load_checkpoint, load_pretrained_hf
@@ -94,8 +91,7 @@ parser.add_argument(
     default="./Qwen3.5-0.8B",
     help="path or HF repo id of pretrained model/tokenizer",
 )
-parser.add_argument("--dataset-root", type=str, default=None, help="root folder whose subdirectories are domains (multi-domain mode)", required=True)
-parser.add_argument("--domain-weights", type=str, default=None, help='JSON dict of per-domain weights, e.g. \'{"web": 1.0, "code": 2.0}\' (multi-domain mode only; default: uniform)')
+parser.add_argument("--dataset-root", type=str, required=True, help="root of merged flat shards (output of pretokenize_and_merge.py)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -365,29 +361,23 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-domain_weights = json.loads(args.domain_weights) if args.domain_weights else None
-_pretok_meta = get_pretokenize_metadata(args.dataset_root)
-if _pretok_meta is not None:
-    print0(f"Pretokenized dataset detected (T={_pretok_meta['T']}) — using packed dataloader (zero runtime tokenization)")
-    train_loader = packed_distributed_data_loader_with_state_weighted(
-        args.device_batch_size, args.max_seq_len, split="train",
-        dataset_root=args.dataset_root, domain_weights=domain_weights,
-        device=device, resume_state_dict=dataloader_resume_state_dict,
-    )
-    build_val_loader = lambda: packed_distributed_data_loader_weighted(
-        args.device_batch_size, args.max_seq_len, split="val",
-        dataset_root=args.dataset_root, device=device,
-    )
-else:
-    train_loader = tokenizing_distributed_data_loader_with_state_weighted(
-        tokenizer, args.device_batch_size, args.max_seq_len, split="train",
-        dataset_root=args.dataset_root, domain_weights=domain_weights,
-        device=device, resume_state_dict=dataloader_resume_state_dict,
-    )
-    build_val_loader = lambda: tokenizing_distributed_data_loader_weighted(
-        tokenizer, args.device_batch_size, args.max_seq_len, split="val",
-        dataset_root=args.dataset_root, device=device,
-    )
+
+from nanoqwen35.dataset import get_merged_metadata
+_merged_meta = get_merged_metadata(args.dataset_root)
+assert _merged_meta is not None, (
+    f"merged_metadata.json not found in {args.dataset_root}. "
+    "Run: python -m scripts.pretokenize_and_merge --source-root ... --output-root ..."
+)
+print0(f"Merged dataset: T={_merged_meta['T']}, {_merged_meta['num_train_rows']:,} train rows, {_merged_meta['num_train_shards']} shards")
+train_loader = pretrain_loader_with_state(
+    args.device_batch_size, args.max_seq_len, split="train",
+    dataset_root=args.dataset_root, device=device,
+    resume_state_dict=dataloader_resume_state_dict,
+)
+build_val_loader = lambda: pretrain_loader(
+    args.device_batch_size, args.max_seq_len, split="val",
+    dataset_root=args.dataset_root, device=device,
+)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -586,10 +576,7 @@ while True:
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    if "domain_states" in dataloader_state_dict:
-        epoch = " | ".join(f"{d}: ep{s['epoch']} pq{s['pq_idx']}" for d, s in dataloader_state_dict["domain_states"].items())
-    else:
-        epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    epoch = f"ep{dataloader_state_dict['epoch']} pq{dataloader_state_dict['pq_idx']} rg{dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         lr_log = {f"train/lr_{g['kind']}": g["lr"] for g in optimizer.param_groups}
