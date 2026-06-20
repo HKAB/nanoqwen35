@@ -8,6 +8,16 @@ all, globally shuffles, and writes flat shards to --output-root.
 No domain concept — all files are treated as one flat pool.
 Parallelism: files are chunked across --workers processes.
 
+Memory model:
+  Each worker tokenizes its chunk and writes rows to a temp .npy file on disk
+  (never held in the main process RAM).  After all workers finish, main loads
+  each temp file one-at-a-time into a memory-mapped scratch file (disk-backed),
+  generates a global shuffle index (tiny: n_rows × 4 bytes), then writes output
+  shards by reading from the scratch file in sorted-index order (sequential I/O).
+
+  Peak RAM in main: max(one_chunk_rows) × (T+1) × 4 bytes ≈ hundreds of MB.
+  Scratch disk: total_rows × (T+1) × 4 bytes ≈ same size as output.
+
 Output is read directly by base_train.py (looks for merged_metadata.json).
 
 Usage:
@@ -30,6 +40,7 @@ import os
 import sys
 import json
 import math
+import time
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -42,25 +53,29 @@ import pyarrow.parquet as pq
 # Worker — top-level so ProcessPoolExecutor can pickle it
 # ---------------------------------------------------------------------------
 
-def _tokenize_files(task: dict) -> "np.ndarray | None":
+def _tokenize_files(task: dict) -> dict:
     """
-    Tokenize a flat list of parquet files.
+    Tokenize a flat list of parquet files and write rows to a temp .npy file.
 
-    Streams all text rows through the HF Rust tokenizer, appending EOS after
-    every document, then slices the token stream into T+1 packed rows.
-    Any sub-row tail at the end of the last file is discarded.
-
-    Returns an np.int32 array of shape (n_rows, T+1), or None if no rows produced.
+    Returns {"tmp_path": str, "n_rows": int, "elapsed": float}.
+    The caller is responsible for deleting tmp_path after use.
     """
+    import time as _time
     from tokenizers import Tokenizer as HFTokenizer
 
-    files    = task["files"]
-    tok_path = task["tokenizer_path"]
-    T        = task["T"]
-    T1       = T + 1
+    files       = task["files"]
+    tok_path    = task["tokenizer_path"]
+    T           = task["T"]
+    T1          = T + 1
+    chunk_id    = task["chunk_id"]
+    split       = task["split"]
+    output_root = task["output_root"]
+    label       = f"[{split}|W{chunk_id:02d}]"
+    n_files     = len(files)
+    tmp_path    = os.path.join(output_root, f".tmp_{split}_w{chunk_id:03d}.npy")
 
     if not files:
-        return None
+        return {"tmp_path": None, "n_rows": 0, "elapsed": 0.0}
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
     tok    = HFTokenizer.from_pretrained(tok_path)
@@ -69,10 +84,18 @@ def _tokenize_files(task: dict) -> "np.ndarray | None":
 
     overflow:   np.ndarray       = np.empty(0, dtype=np.int32)
     row_chunks: list[np.ndarray] = []
+    total_rows  = 0
+    t_start     = _time.time()
 
-    for filepath in files:
-        pf = pq.ParquetFile(filepath)
-        for rg_i in range(pf.num_row_groups):
+    for f_idx, filepath in enumerate(files):
+        fname  = os.path.basename(filepath)
+        pf     = pq.ParquetFile(filepath)
+        n_rgs  = pf.num_row_groups
+        print(f"{label} {f_idx+1:3d}/{n_files} start  {fname}  ({n_rgs} rg)", flush=True)
+        t_file      = _time.time()
+        rows_before = total_rows
+
+        for rg_i in range(n_rgs):
             rg    = pf.read_row_group(rg_i, columns=["text"])
             texts = rg.column("text").to_pylist()
             encs  = tok.encode_batch(texts, add_special_tokens=False)
@@ -87,14 +110,38 @@ def _tokenize_files(task: dict) -> "np.ndarray | None":
             n_complete = len(stream) // T1
             if n_complete > 0:
                 row_chunks.append(stream[:n_complete * T1].reshape(n_complete, T1).copy())
-                overflow = stream[n_complete * T1:].copy()
+                overflow    = stream[n_complete * T1:].copy()
+                total_rows += n_complete
             else:
                 overflow = stream.copy()
 
-    if not row_chunks:
-        return None
+        new_rows = total_rows - rows_before
+        dt_file  = _time.time() - t_file
+        print(
+            f"{label} {f_idx+1:3d}/{n_files} done   {fname}  "
+            f"+{new_rows:>8,} rows  total {total_rows:>10,}  ({dt_file:.1f}s)",
+            flush=True,
+        )
 
-    return np.concatenate(row_chunks, axis=0)
+    elapsed = _time.time() - t_start
+
+    if not row_chunks:
+        print(f"{label} WARNING: 0 rows produced from {n_files} files", flush=True)
+        return {"tmp_path": None, "n_rows": 0, "elapsed": elapsed}
+
+    rows = np.concatenate(row_chunks, axis=0)
+    del row_chunks
+
+    print(f"{label} saving {len(rows):,} rows to temp file...", flush=True)
+    np.save(tmp_path, rows)
+    del rows
+
+    elapsed = _time.time() - t_start
+    print(
+        f"{label} COMPLETE — {n_files} files  {total_rows:,} rows  {elapsed:.1f}s",
+        flush=True,
+    )
+    return {"tmp_path": tmp_path, "n_rows": total_rows, "elapsed": elapsed}
 
 
 # ---------------------------------------------------------------------------
@@ -115,39 +162,107 @@ def _write_shard(path: str, rows_np: np.ndarray, T_plus_1: int, rows_per_rg: int
 
 
 def _write_split(
-    split:       str,
-    all_rows:    np.ndarray,
-    output_root: str,
-    num_shards:  int,
-    T_plus_1:    int,
-    rows_per_rg: int,
-    rng:         np.random.Generator,
+    split:        str,
+    chunk_results: list,          # list of dicts from _tokenize_files
+    output_root:  str,
+    num_shards:   int,
+    T_plus_1:     int,
+    rows_per_rg:  int,
+    seed:         int,
 ) -> int:
-    """Shuffle all_rows in-place and write to flat parquet shards. Returns actual row count."""
-    if len(all_rows) == 0:
+    """
+    Merge temp chunk files → memory-mapped scratch → globally shuffled output shards.
+
+    Steps:
+      1. Load each chunk's .npy file into a memmap (one chunk at a time → low peak RAM)
+      2. Build a global shuffle index (just integers, tiny)
+      3. Write each output shard by reading shuffled rows from the memmap
+      4. Delete scratch file and temp .npy files
+    """
+    valid = [(r["tmp_path"], r["n_rows"]) for r in chunk_results if r["n_rows"] > 0]
+    if not valid:
         print(f"[{split}] WARNING: 0 rows — no shards written", flush=True)
         return 0
 
-    print(f"[{split}] shuffling {len(all_rows):,} rows...", flush=True)
-    rng.shuffle(all_rows)
+    total_rows = sum(n for _, n in valid)
+    scratch    = os.path.join(output_root, f".{split}_scratch.bin")
 
-    actual_shards  = min(num_shards, len(all_rows))
-    rows_per_shard = math.ceil(len(all_rows) / actual_shards)
+    # ------------------------------------------------------------------
+    # Phase 1: load temp files into memmap (one at a time)
+    print(f"\n[{split}] creating scratch memmap ({total_rows:,} × {T_plus_1} int32 = "
+          f"{total_rows * T_plus_1 * 4 / 1e9:.2f} GB)...", flush=True)
+    mm     = np.memmap(scratch, dtype=np.int32, mode="w+", shape=(total_rows, T_plus_1))
+    offset = 0
+    t_load = time.time()
+
+    for tmp_path, n_rows in valid:
+        chunk = np.load(tmp_path, mmap_mode="r")   # mmap avoids double-buffering
+        mm[offset:offset + n_rows] = chunk
+        offset += n_rows
+        os.remove(tmp_path)
+        print(
+            f"[{split}]   loaded → {offset:>10,}/{total_rows:,} rows  "
+            f"({100*offset//total_rows:3d}%)  {time.time()-t_load:.1f}s",
+            flush=True,
+        )
+        del chunk
+
+    mm.flush()
+    print(f"[{split}] memmap ready ({time.time()-t_load:.1f}s)", flush=True)
+
+    # ------------------------------------------------------------------
+    # Phase 2: global shuffle index (fits in RAM: total_rows × 8 bytes)
+    rng = np.random.default_rng(seed)
+    print(f"[{split}] generating shuffle index...", flush=True)
+    idx = rng.permutation(total_rows)
+
+    # ------------------------------------------------------------------
+    # Phase 3: write output shards
+    actual_shards  = min(num_shards, total_rows)
+    rows_per_shard = math.ceil(total_rows / actual_shards)
     if actual_shards < num_shards:
-        print(f"[{split}] WARNING: only {len(all_rows):,} rows — writing {actual_shards} shards (< requested {num_shards})", flush=True)
+        print(f"[{split}] WARNING: only {total_rows:,} rows — writing {actual_shards} shards", flush=True)
 
-    print(f"[{split}] writing {actual_shards} shards (~{rows_per_shard:,} rows each)...", flush=True)
-    for i in range(actual_shards):
-        start = i * rows_per_shard
+    print(
+        f"[{split}] writing {actual_shards} shards (~{rows_per_shard:,} rows each)...",
+        flush=True,
+    )
+    log_every = max(1, actual_shards // 10)
+    t_write   = time.time()
+
+    for shard_i in range(actual_shards):
+        # Sort the shard's indices so memmap reads are sequential (much faster I/O)
+        shard_idx  = np.sort(idx[shard_i * rows_per_shard : (shard_i + 1) * rows_per_shard])
+        shard_rows = np.array(mm[shard_idx])   # copy into RAM — one shard at a time
         _write_shard(
-            os.path.join(output_root, f"{split}_{i:04d}.parquet"),
-            all_rows[start:start + rows_per_shard],
+            os.path.join(output_root, f"{split}_{shard_i:04d}.parquet"),
+            shard_rows,
             T_plus_1,
             rows_per_rg,
         )
+        del shard_rows
 
-    print(f"[{split}] done — {len(all_rows):,} rows → {actual_shards} shards", flush=True)
-    return len(all_rows)
+        if (shard_i + 1) % log_every == 0 or (shard_i + 1) == actual_shards:
+            elapsed = time.time() - t_write
+            rate    = (shard_i + 1) / elapsed if elapsed > 0 else 0
+            eta     = (actual_shards - shard_i - 1) / rate if rate > 0 else 0
+            print(
+                f"[{split}] shards {shard_i+1:4d}/{actual_shards}  "
+                f"({100*(shard_i+1)//actual_shards:3d}%)  "
+                f"{elapsed:.0f}s elapsed  eta {eta:.0f}s",
+                flush=True,
+            )
+
+    # ------------------------------------------------------------------
+    # Phase 4: cleanup scratch
+    del mm
+    os.remove(scratch)
+    print(
+        f"[{split}] done — {total_rows:,} rows → {actual_shards} shards  "
+        f"({time.time()-t_write:.1f}s write)",
+        flush=True,
+    )
+    return total_rows
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +271,7 @@ def _write_split(
 
 def _chunk(files: list, n: int) -> list:
     """Split files into n roughly equal chunks."""
-    n = min(n, len(files))
+    n    = min(n, len(files))
     size = math.ceil(len(files) / n)
     return [files[i:i + size] for i in range(0, len(files), size)]
 
@@ -201,70 +316,85 @@ def main() -> None:
 
     print(f"{'='*60}")
     print(f"pretokenize_and_merge")
-    print(f"  source    : {args.source_root}")
-    print(f"  output    : {args.output_root}")
-    print(f"  tokenizer : {args.tokenizer}")
-    print(f"  T         : {T}")
-    print(f"  workers   : {args.workers}")
-    print(f"  seed      : {args.seed}")
-    print(f"  train files: {len(train_files)}")
-    print(f"  val files  : {len(val_files)}")
+    print(f"  source      : {args.source_root}")
+    print(f"  output      : {args.output_root}")
+    print(f"  tokenizer   : {args.tokenizer}")
+    print(f"  T           : {T}")
+    print(f"  workers     : {args.workers}")
+    print(f"  seed        : {args.seed}")
+    print(f"  train files : {len(train_files)}")
+    print(f"  val files   : {len(val_files)}")
     print(f"{'='*60}\n")
 
     # ------------------------------------------------------------------
-    # Chunk files and submit tasks
+    # Chunk files and build tasks
     train_chunks = _chunk(train_files, args.workers)
     val_chunks   = _chunk(val_files,   args.workers) if val_files else []
 
-    all_tasks = [("train", c) for c in train_chunks] + [("val", c) for c in val_chunks]
+    all_tasks = []
+    for i, chunk in enumerate(train_chunks):
+        all_tasks.append({
+            "files": chunk, "tokenizer_path": args.tokenizer, "T": T,
+            "chunk_id": i, "split": "train", "output_root": args.output_root,
+        })
+    for i, chunk in enumerate(val_chunks):
+        all_tasks.append({
+            "files": chunk, "tokenizer_path": args.tokenizer, "T": T,
+            "chunk_id": i, "split": "val", "output_root": args.output_root,
+        })
+
     n_workers = min(args.workers, len(all_tasks))
+    n_total   = len(all_tasks)
+    print(
+        f"Submitting {len(train_chunks)} train + {len(val_chunks)} val chunks "
+        f"({n_workers} parallel workers)...\n",
+        flush=True,
+    )
 
-    print(f"Submitting {len(train_chunks)} train + {len(val_chunks)} val chunks ({n_workers} workers)...\n")
-
-    train_arrays: list[np.ndarray] = []
-    val_arrays:   list[np.ndarray] = []
+    train_results: list[dict] = []
+    val_results:   list[dict] = []
+    n_done   = 0
+    t_global = time.time()
 
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futs = {
-            pool.submit(_tokenize_files, {"files": chunk, "tokenizer_path": args.tokenizer, "T": T}): (split, i)
-            for i, (split, chunk) in enumerate(all_tasks)
-        }
-        for fut in as_completed(futs):
-            split, i = futs[fut]
-            try:
-                rows = fut.result()
-            except Exception as exc:
-                print(f"FAILED chunk {i} ({split}): {exc}", file=sys.stderr)
-                raise
-            if rows is not None:
-                print(f"  chunk {i:03d} [{split}]: {len(rows):,} rows", flush=True)
-                if split == "train":
-                    train_arrays.append(rows)
-                else:
-                    val_arrays.append(rows)
+        futs = {pool.submit(_tokenize_files, task): task for task in all_tasks}
 
-    rng = np.random.default_rng(args.seed)
+        for fut in as_completed(futs):
+            task = futs[fut]
+            split, chunk_id = task["split"], task["chunk_id"]
+            try:
+                result = fut.result()
+            except Exception as exc:
+                print(f"FAILED [{split}|W{chunk_id:02d}]: {exc}", file=sys.stderr)
+                raise
+
+            n_done  += 1
+            elapsed  = time.time() - t_global
+            print(
+                f">>> [{split}|W{chunk_id:02d}] chunk done — {result['n_rows']:,} rows  "
+                f"({n_done}/{n_total} chunks, {elapsed:.0f}s elapsed)\n",
+                flush=True,
+            )
+            if split == "train":
+                train_results.append(result)
+            else:
+                val_results.append(result)
 
     # ------------------------------------------------------------------
     # Merge, shuffle, write — train
-    print("\n[train] concatenating chunks...")
-    all_train = np.concatenate(train_arrays, axis=0)
-    del train_arrays
-    num_train = _write_split("train", all_train, args.output_root, args.num_shards, T_plus_1, args.rows_per_rg, rng)
-    del all_train
+    num_train = _write_split(
+        "train", train_results, args.output_root,
+        args.num_shards, T_plus_1, args.rows_per_rg, args.seed,
+    )
 
-    # ------------------------------------------------------------------
     # Merge, shuffle, write — val
-    if val_arrays:
-        print("\n[val] concatenating chunks...")
-        all_val = np.concatenate(val_arrays, axis=0)
-        del val_arrays
-        num_val = _write_split("val", all_val, args.output_root, args.num_val_shards, T_plus_1, args.rows_per_rg,
-                               np.random.default_rng(args.seed + 1))
-        del all_val
-    else:
-        print("\n[val] WARNING: no val files found — skipping")
-        num_val = 0
+    num_val = _write_split(
+        "val", val_results, args.output_root,
+        args.num_val_shards, T_plus_1, args.rows_per_rg, args.seed + 1,
+    ) if val_results else 0
+
+    if not val_results:
+        print("\n[val] WARNING: no val files found — skipping", flush=True)
 
     # ------------------------------------------------------------------
     # Write metadata
@@ -281,12 +411,13 @@ def main() -> None:
     with open(out_meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
+    total_elapsed = time.time() - t_global
     print(f"\n{'='*60}")
-    print(f"Done.")
+    print(f"Done in {total_elapsed:.0f}s ({total_elapsed/60:.1f} min)")
     print(f"  Train : {num_train:,} rows  →  {args.num_shards} shards")
     print(f"  Val   : {num_val:,} rows  →  {args.num_val_shards} shards")
     print(f"  Meta  : {out_meta_path}")
-    print(f"\nAt world_size=8: {args.num_shards // 8} train shards per rank (file-sharding guaranteed)")
+    print(f"\nAt world_size=8: {args.num_shards // 8} train shards per rank")
 
 
 if __name__ == "__main__":
