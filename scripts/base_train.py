@@ -280,7 +280,10 @@ print0(f"Parameter counts:")
 for key, value in param_counts.items():
     print0(f"{key:24s}: {value:,}")
 num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops(args.device_batch_size*ddp_world_size, args.max_seq_len)
+# estimate_flops returns TOTAL FLOPs for a (global_batch_size x seq_len) batch,
+# so divide by the token count to get true per-token FLOPs (used for MFU / FLOP logging).
+_flops_global_batch = args.device_batch_size * ddp_world_size
+num_flops_per_token = model.estimate_flops(_flops_global_batch, args.max_seq_len) / (_flops_global_batch * args.max_seq_len)
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # Manually configured batch size / LR / WD
