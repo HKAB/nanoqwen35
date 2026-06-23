@@ -4,9 +4,15 @@ Distributed dataloaders.
 Two loaders, each for a different training stage:
 
   pretrain_loader / pretrain_loader_with_state   — pretrain
-      Reads pre-tokenized flat shards produced by scripts/pretokenize_and_merge.py.
-      Each row is already a packed T+1 token sequence; no runtime tokenization.
-      File-level DDP sharding: each rank reads disjoint shards.
+      Reads pre-tokenized parquet files produced by scripts/pretokenize.py.
+      Each parquet stores an "input_ids" column of packed token blocks; the
+      loader streams those tokens and re-chunks them into T+1 sequences, so no
+      runtime tokenization is needed and the block size is decoupled from T.
+
+      All files under dataset_root are deterministically shuffled (fixed seed)
+      and partitioned once: each rank gets `files_per_rank` disjoint training
+      files, and the leftover files form a shared validation set (see
+      _partition_files). The partition is identical on every rank.
 
   sft_loader                                     — SFT / RL
       Reads raw parquet files with a 'messages' field (chat format).
@@ -24,142 +30,126 @@ import torch
 import pyarrow.parquet as pq
 
 from nanoqwen35.common import get_dist_info, print0
-from nanoqwen35.dataset import list_parquet_files_by_domain
+from nanoqwen35.dataset import list_parquet_files_by_domain, list_all_parquet_files
 
 
 # ---------------------------------------------------------------------------
 # Pre-tokenized dataloader (pretrain)
 # ---------------------------------------------------------------------------
 
-def _row_iter(split, resume_state_dict, parquet_files):
+def _partition_files(dataset_root, world_size, seed):
     """
-    Infinite iterator over pre-packed rows from pretokenized parquet files.
+    Deterministically shuffle every parquet file under dataset_root and split
+    into per-rank training files plus a shared validation set.
 
-    Each yield is (row_np, (pq_idx, rg_idx, epoch)) where row_np is a
-    np.int32 array of shape (T+1,).
+    `files_per_rank = total // world_size`, decremented until the leftover
+    (validation) count is at least `world_size` so val can shard across ranks.
+    Example: 925 files, 8 ranks → 114 train/rank (912 total) + 13 val.
 
-    Sharding strategy:
-    - File-level (preferred): each rank owns disjoint files [rank, rank+W, ...].
-      No two ranks open the same file — eliminates NFS metadata contention.
-    - Row-group fallback: used when domain has fewer files than ranks. All ranks
-      open all files but stride row-groups by world_size.
+    Returns (train_files, val_files, files_per_rank). The result is identical on
+    every rank since both the file listing and the shuffle are deterministic.
     """
-    _, ddp_rank, _, ddp_world_size = get_dist_info()
+    files = list_all_parquet_files(dataset_root)
+    assert files, f"No parquet files found under {dataset_root}"
 
-    parquet_paths = list(parquet_files)
-    assert parquet_paths, "No pretokenized parquet files found"
+    random.Random(seed).shuffle(files)
 
-    basename = os.path.basename
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if "train" in basename(p)]
-    else:
-        parquet_paths = [p for p in parquet_paths if "val" in basename(p)]
-    assert parquet_paths, f"No parquet files found for split '{split}'"
+    files_per_rank = len(files) // world_size
+    while files_per_rank > 0 and len(files) - files_per_rank * world_size < world_size:
+        files_per_rank -= 1
+    assert files_per_rank > 0, (
+        f"Only {len(files)} files for {world_size} ranks — too few to partition."
+    )
 
-    file_sharding = len(parquet_paths) >= ddp_world_size
-    if file_sharding:
-        parquet_paths = parquet_paths[ddp_rank::ddp_world_size]
+    train_files = files[:files_per_rank * world_size]
+    val_files   = files[files_per_rank * world_size:]
+    return train_files, val_files, files_per_rank
 
-    raw_resume_pq  = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
-    resume_rg_idx  = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
-    resume_epoch   = resume_state_dict.get("epoch", 1) if resume_state_dict is not None else 1
-    resume_pq_idx  = raw_resume_pq // ddp_world_size if file_sharding else raw_resume_pq
+
+def _row_iter(paths, T1, resume_state_dict=None):
+    """
+    Infinite iterator over T1-length token sequences from the given parquet files.
+
+    The "input_ids" column of each row group is read as one flat token stream and
+    re-chunked into fixed T1 (= T+1) windows, carrying the remainder across row
+    groups. Each yield is (row_np, (pq_idx, rg_idx, epoch)) with row_np a
+    np.int32 array of shape (T1,).
+
+    On resume, iteration restarts after (pq_idx, rg_idx); the in-flight carry of
+    < T1 tokens is dropped (negligible for pretraining).
+    """
+    assert paths, "No parquet files to iterate"
+
+    resume_pq  = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
+    resume_rg  = resume_state_dict.get("rg_idx") if resume_state_dict is not None else None
+    epoch      = resume_state_dict.get("epoch", 1) if resume_state_dict is not None else 1
 
     first_pass = True
-    epoch = resume_epoch
+    carry = np.empty(0, dtype=np.int32)
 
     while True:
-        start_pq = resume_pq_idx if first_pass else 0
-        for local_pq_idx in range(start_pq, len(parquet_paths)):
-            global_pq_idx = local_pq_idx * ddp_world_size + ddp_rank if file_sharding else local_pq_idx
-            pf = pq.ParquetFile(parquet_paths[local_pq_idx])
+        start_pq = resume_pq if first_pass else 0
+        for pq_idx in range(start_pq, len(paths)):
+            pf = pq.ParquetFile(paths[pq_idx])
 
-            if file_sharding:
-                start_rg = 0
-                if first_pass and resume_rg_idx is not None and local_pq_idx == start_pq:
-                    start_rg = resume_rg_idx + 1
-                    resume_rg_idx = None
-                for rg_idx in range(start_rg, pf.num_row_groups):
-                    col = pf.read_row_group(rg_idx, columns=["input_ids"]).column("input_ids")
-                    c = col.combine_chunks() if col.num_chunks > 1 else col.chunks[0]
-                    flat_np = c.values.to_numpy(zero_copy_only=False)
-                    rows_np = flat_np.reshape(len(c), -1)
-                    for row_i in range(len(rows_np)):
-                        yield rows_np[row_i], (global_pq_idx, rg_idx, epoch)
-            else:
-                if first_pass and resume_rg_idx is not None and local_pq_idx == start_pq:
-                    base_idx = resume_rg_idx // ddp_world_size + 1
-                    rg_idx = base_idx * ddp_world_size + ddp_rank
-                    if rg_idx >= pf.num_row_groups:
-                        continue
-                    resume_rg_idx = None
-                else:
-                    rg_idx = ddp_rank
-                while rg_idx < pf.num_row_groups:
-                    col = pf.read_row_group(rg_idx, columns=["input_ids"]).column("input_ids")
-                    c = col.combine_chunks() if col.num_chunks > 1 else col.chunks[0]
-                    flat_np = c.values.to_numpy(zero_copy_only=False)
-                    rows_np = flat_np.reshape(len(c), -1)
-                    for row_i in range(len(rows_np)):
-                        yield rows_np[row_i], (global_pq_idx, rg_idx, epoch)
-                    rg_idx += ddp_world_size
+            start_rg = 0
+            if first_pass and resume_rg is not None and pq_idx == start_pq:
+                start_rg = resume_rg + 1
+                resume_rg = None
+
+            for rg_idx in range(start_rg, pf.num_row_groups):
+                col = pf.read_row_group(rg_idx, columns=["input_ids"]).column("input_ids")
+                c = col.combine_chunks() if col.num_chunks > 1 else col.chunks[0]
+                flat_np = c.values.to_numpy(zero_copy_only=False)
+
+                stream = np.concatenate([carry, flat_np]) if carry.size else flat_np
+                n_full = (len(stream) // T1) * T1
+                for off in range(0, n_full, T1):
+                    yield stream[off:off + T1], (pq_idx, rg_idx, epoch)
+                carry = stream[n_full:].copy()
 
         first_pass = False
         epoch += 1
 
-
-# ---------------------------------------------------------------------------
-# Merged flat dataloader (output of scripts/pretokenize_and_merge.py)
-# ---------------------------------------------------------------------------
 
 def pretrain_loader_with_state(
     B, T, split,
     dataset_root,
     device="cuda",
     resume_state_dict=None,
+    seed=42,
 ):
     """
-    Pretrain dataloader for merged flat shards from scripts/pretokenize_and_merge.py.
+    Pretrain dataloader over pre-tokenized parquet files in dataset_root.
 
-    Reads train_XXXX.parquet / val_XXXX.parquet directly from dataset_root with
-    file-level DDP sharding: each rank reads disjoint shards.
+    Files are partitioned by _partition_files: each rank reads its disjoint
+    training files, while validation reads the leftover files strided across
+    ranks. Rows are streamed and re-chunked into T+1 sequences.
 
     State dict format: {"pq_idx": int, "rg_idx": int, "epoch": int}
     """
     assert split in ("train", "val"), "split must be 'train' or 'val'"
 
-    from nanoqwen35.dataset import get_merged_metadata
+    _, ddp_rank, _, ddp_world_size = get_dist_info()
+    train_files, val_files, files_per_rank = _partition_files(dataset_root, ddp_world_size, seed)
 
-    meta = get_merged_metadata(dataset_root)
-    assert meta is not None, (
-        f"merged_metadata.json not found in {dataset_root}. "
-        "Run: python -m scripts.pretokenize_and_merge --source-root ... --output-root ..."
+    if split == "train":
+        my_files = train_files[ddp_rank * files_per_rank:(ddp_rank + 1) * files_per_rank]
+        resume = resume_state_dict
+    else:
+        my_files = val_files[ddp_rank::ddp_world_size]
+        resume = None  # val is rebuilt fresh on every eval
+    assert my_files, f"Rank {ddp_rank} has no {split} files"
+
+    print0(
+        f"  [pretrain] {split}: {len(train_files)} train files "
+        f"({files_per_rank}/rank × {ddp_world_size}) + {len(val_files)} val files"
     )
-    assert meta["T"] == T, (
-        f"Sequence length mismatch: merged dataset has T={meta['T']} but training uses T={T}. "
-        f"Re-run pretokenize_and_merge.py with --T {T}."
-    )
 
-    # Collect flat shard files for this split
-    shard_files = sorted(
-        os.path.join(dataset_root, f)
-        for f in os.listdir(dataset_root)
-        if f.startswith(f"{split}_") and f.endswith(".parquet") and not f.endswith(".tmp")
-    )
-    assert shard_files, f"No {split} shards found in {dataset_root}"
+    T1 = T + 1
+    row_iter = _row_iter(my_files, T1, resume)
 
-    _, _, _, ddp_world_size = get_dist_info()
-    mode = (
-        "file-sharding"
-        if len(shard_files) >= ddp_world_size
-        else f"row-group-fallback ({len(shard_files)} shards < {ddp_world_size} ranks)"
-    )
-    print0(f"  [merged] {split}: {len(shard_files)} shards → {mode}")
-
-    # _row_iter filters by split name and handles file-level DDP sharding
-    row_iter = _row_iter(split, resume_state_dict, shard_files)
-
-    row_buffer = np.empty((B, T + 1), dtype=np.int32)
+    row_buffer = np.empty((B, T1), dtype=np.int32)
     use_cuda   = device == "cuda"
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)

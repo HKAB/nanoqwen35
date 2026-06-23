@@ -362,13 +362,7 @@ if scaler is not None:
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 
-from nanoqwen35.dataset import get_merged_metadata
-_merged_meta = get_merged_metadata(args.dataset_root)
-assert _merged_meta is not None, (
-    f"merged_metadata.json not found in {args.dataset_root}. "
-    "Run: python -m scripts.pretokenize_and_merge --source-root ... --output-root ..."
-)
-print0(f"Merged dataset: T={_merged_meta['T']}, {_merged_meta['num_train_rows']:,} train rows, {_merged_meta['num_train_shards']} shards")
+print0(f"Pretokenized dataset root: {args.dataset_root}")
 train_loader = pretrain_loader_with_state(
     args.device_batch_size, args.max_seq_len, split="train",
     dataset_root=args.dataset_root, device=device,

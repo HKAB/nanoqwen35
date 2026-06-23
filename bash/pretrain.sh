@@ -1,5 +1,5 @@
-# Pre-training with merged flat dataset.
-# Pipeline: raw parquet → pretokenize_and_merge.sh → this script.
+# Pre-training on pre-tokenized parquet files.
+# Pipeline: raw jsonl → pretokenize.sh → this script.
 
 export WANDB_MODE=offline
 # export NCCL_TIMEOUT=7200
@@ -11,7 +11,7 @@ torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.base_train -- 
     --wandb-entity hkab \
     --wandb-tags "0.8B,pretrain" \
     --pretrained-model-path /mnt/data/huggingface/hub/models--Qwen--Qwen3.5-0.8B-Base/snapshots/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68 \
-    --dataset-root /mnt/data/users/truongnp5/final_clean_data/vi_en_merged_v1 \
+    --dataset-root /mnt/data/users/truongnp5/final_clean_data/vi_en_parquet_v1_pretokenized \
     --max-seq-len 4096 \
     --num-iterations 14200 \
     --device-batch-size 4 \
