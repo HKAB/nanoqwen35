@@ -30,7 +30,7 @@ import argparse
 from nanoqwen35.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type
 from nanoqwen35.checkpoint_manager import load_pretrained_hf
 from nanoqwen35.core_eval import evaluate_task
-from nanoqwen35.dataloader import tokenizing_distributed_data_loader_weighted
+from nanoqwen35.dataloader import pretrain_loader
 from nanoqwen35.loss_eval import evaluate_loss
 from nanoqwen35.engine import Engine
 
@@ -133,6 +133,7 @@ def main():
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
+    parser.add_argument('--dataset-root', type=str, default=None, help='Root dir of pre-tokenized parquet files (required for loss eval)')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
     args = parser.parse_args()
@@ -200,13 +201,18 @@ def main():
         print0("\n" + "="*80)
         print0("BPB Evaluation")
         print0("="*80)
+        assert args.dataset_root is not None, "loss eval requires --dataset-root (pre-tokenized parquet files)"
         tokens_per_step = args.device_batch_size * sequence_len * ddp_world_size
         if args.split_tokens % tokens_per_step != 0:
             args.split_tokens = (args.split_tokens // tokens_per_step) * tokens_per_step
             print0(f"Adjusted split_tokens to {args.split_tokens} (must be divisible by {tokens_per_step})")
         steps = args.split_tokens // tokens_per_step
 
-        loader = tokenizing_distributed_data_loader_weighted(tokenizer, args.device_batch_size, sequence_len, "val", device=device)
+        # Pre-tokenized data: read the held-out val files directly, no online tokenization.
+        loader = pretrain_loader(
+            args.device_batch_size, sequence_len, split="val",
+            dataset_root=args.dataset_root, device=device,
+        )
         loss = evaluate_loss(model, loader, steps)
         loss_results["val"] = loss
         print0(f"Val loss: {loss:.6f}")
