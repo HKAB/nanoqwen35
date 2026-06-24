@@ -2,6 +2,7 @@
 # Pipeline: raw jsonl → pretokenize.sh → this script.
 
 export WANDB_MODE=offline
+export NANOQWEN_BASE_DIR=/mnt/data/users/truongnp5/uv_env/nanoqwen35/.cache/nanoqwen35
 
 torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.base_train -- \
     --run qwen_0.8B \
@@ -25,7 +26,7 @@ torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.base_train -- 
     --final-lr-frac 0.1 \
     --eval-every 1000 \
     --eval-tokens 1048576 \
-    --core-metric-every 500 \
-    --core-metric-max-per-task 500 \
-    --sample-every 500 \
-    --save-every 2000
+    --core-metric-every 1000 \
+    --core-metric-max-per-task 1000 \
+    --sample-every 1000 \
+    --save-every 5000
