@@ -30,7 +30,7 @@ import torch
 import pyarrow.parquet as pq
 
 from nanoqwen35.common import get_dist_info, print0
-from nanoqwen35.dataset import list_parquet_files_by_domain, list_all_parquet_files
+from nanoqwen35.dataset import list_parquet_files_by_domain, list_all_parquet_files, get_pretokenize_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -326,3 +326,126 @@ def sft_loader(
 
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         yield inputs, targets
+
+
+# ---------------------------------------------------------------------------
+# Pre-tokenized SFT dataloader (offline neat-packed, block-diagonal attention)
+# ---------------------------------------------------------------------------
+
+def _input_space_segs(seg_lens, T):
+    """Project stored block segments (which sum to L = T+1) onto the T-length input.
+
+    The block's final token is dropped by the input/target shift, so the segment
+    tiling is capped at T; the last covered segment loses its final token (or a
+    length-1 trailing segment disappears). The result always sums to T.
+    """
+    out, rem = [], T
+    for s in seg_lens:
+        if rem <= 0:
+            break
+        take = s if s <= rem else rem
+        out.append(take)
+        rem -= take
+    return out
+
+
+def _sft_block_iter(paths):
+    """Infinite iterator over packed SFT blocks: (input_ids, loss_mask, seq_lens).
+
+    Reads the three columns written by scripts/pretokenize.py (--mode sft) row by
+    row, 1:1, with no re-chunking (re-chunking would misalign masks and segments).
+    """
+    assert paths, "No parquet files to iterate"
+    while True:
+        for path in paths:
+            pf = pq.ParquetFile(path)
+            for rg_idx in range(pf.num_row_groups):
+                tbl = pf.read_row_group(rg_idx, columns=["input_ids", "loss_mask", "seq_lens"])
+                ids_col  = tbl.column("input_ids").to_pylist()
+                mask_col = tbl.column("loss_mask").to_pylist()
+                seg_col  = tbl.column("seq_lens").to_pylist()
+                for ids, mask, segs in zip(ids_col, mask_col, seg_col):
+                    yield ids, mask, segs
+
+
+def sft_pretokenized_loader(
+    B, T, split,
+    dataset_root,
+    device="cuda",
+    seed=42,
+):
+    """Dataloader over offline neat-packed SFT shards (scripts/pretokenize.py --mode sft).
+
+    Each parquet row is one packed block of length L = T+1 with columns
+    input_ids / loss_mask / seq_lens. Blocks are read 1:1 (no re-chunking). For
+    every block: inputs = block[:-1], targets = block[1:] with non-assistant /
+    padding targets set to -1 (ignore_index used by the model's cross-entropy).
+
+    For block-diagonal attention each packed conversation must only attend to
+    itself, so we also emit:
+      - cu_seqlens   : int32 cumulative segment lengths over the *flattened* B*T
+                       batch (row boundaries are always segment boundaries), as
+                       required by FA3 varlen / FLA. Total = B*T.
+      - position_ids : (B, T) positions that reset to 0 at each segment start.
+
+    Yields (inputs, targets, cu_seqlens, position_ids).
+    """
+    assert split in ("train", "val"), "split must be 'train' or 'val'"
+
+    meta = get_pretokenize_metadata(dataset_root)
+    assert meta is not None and meta.get("mode") == "sft", (
+        f"{dataset_root} has no SFT pretokenize_metadata.json — was it built with --mode sft?"
+    )
+    L = meta["seq_len"]
+    assert L == T + 1, f"max_seq_len+1 ({T + 1}) must equal stored seq_len ({L})"
+
+    _, ddp_rank, _, ddp_world_size = get_dist_info()
+    train_files, val_files, files_per_rank = _partition_files(dataset_root, ddp_world_size, seed)
+    if split == "train":
+        my_files = train_files[ddp_rank * files_per_rank:(ddp_rank + 1) * files_per_rank]
+    else:
+        my_files = val_files[ddp_rank::ddp_world_size]
+    assert my_files, f"Rank {ddp_rank} has no {split} files"
+
+    print0(
+        f"  [sft-pretok] {split}: {len(train_files)} train files "
+        f"({files_per_rank}/rank × {ddp_world_size}) + {len(val_files)} val files"
+    )
+
+    block_iter = _sft_block_iter(my_files)
+
+    use_cuda    = device == "cuda"
+    cpu_buffer  = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer  = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    cpu_inputs  = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs      = gpu_buffer[:B * T].view(B, T)
+    targets     = gpu_buffer[B * T:].view(B, T)
+    cpu_pos     = torch.empty(B * T, dtype=torch.long, pin_memory=use_cuda).view(B, T)
+    gpu_pos     = torch.empty(B * T, dtype=torch.long, device=device).view(B, T)
+
+    while True:
+        all_segs = []  # input-space segment lengths across the whole (flattened) batch
+        for row_idx in range(B):
+            ids, mask, segs = next(block_iter)
+            ids  = np.asarray(ids, dtype=np.int64)
+            mask = np.asarray(mask, dtype=np.int8)
+            assert len(ids) == L, f"block length {len(ids)} != stored seq_len {L}"
+
+            tgt = ids[1:].copy()
+            tgt[mask[1:] == 0] = -1
+            cpu_inputs[row_idx].copy_(torch.from_numpy(ids[:-1]))
+            cpu_targets[row_idx].copy_(torch.from_numpy(tgt))
+
+            iseg = _input_space_segs(segs, T)
+            pos  = np.concatenate([np.arange(s, dtype=np.int64) for s in iseg])
+            cpu_pos[row_idx].copy_(torch.from_numpy(pos))
+            all_segs.extend(iseg)
+
+        cu = np.zeros(len(all_segs) + 1, dtype=np.int32)
+        np.cumsum(all_segs, dtype=np.int32, out=cu[1:])
+
+        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        gpu_pos.copy_(cpu_pos, non_blocking=use_cuda)
+        cu_seqlens = torch.from_numpy(cu).to(device, non_blocking=use_cuda)
+        yield inputs, targets, cu_seqlens, gpu_pos

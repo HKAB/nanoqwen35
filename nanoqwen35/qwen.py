@@ -105,14 +105,20 @@ def compute_rope_params(head_dim, theta_base=10_000.0, context_length=4096, part
 
 def apply_rope_bhsd(x, cos, sin):
     # x shape: (B, num_heads, seq_len, head_dim)
+    # cos/sin are either (seq_len, rot_dim) — contiguous positions (default) — or
+    # (B, seq_len, rot_dim) — per-token positions for packed/block-diagonal inputs.
     _, _, seq_len, head_dim = x.shape
     rot_dim = cos.shape[-1]
     x_rot = x[..., :rot_dim]
     x_pass = x[..., rot_dim:]
     x1 = x_rot[..., : rot_dim // 2]
     x2 = x_rot[..., rot_dim // 2 :]
-    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)
-    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+    if cos.ndim == 2:
+        cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)   # (1, 1, T, rot)
+        sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+    else:
+        cos = cos.unsqueeze(1)                              # (B, 1, T, rot)
+        sin = sin.unsqueeze(1)
     rotated = torch.cat((-x2, x1), dim=-1)
     x_rotated = (x_rot * cos) + (rotated * sin)
     x_out = torch.cat([x_rotated, x_pass], dim=-1)
@@ -142,7 +148,7 @@ class GroupedQueryAttention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
-    def forward(self, x, mask, cos, sin, start_pos=0, cache=None):
+    def forward(self, x, mask, cos, sin, start_pos=0, cache=None, cu_seqlens=None, max_seqlen=None):
         b, num_tokens, _ = x.shape
 
         q_and_gate = self.q_proj(x)
@@ -171,8 +177,18 @@ class GroupedQueryAttention(nn.Module):
         keys_new = keys_new.transpose(1, 2)
         values_new = values_new.transpose(1, 2)
 
-        if cache is None:
-            # Training: casual attention with FA3
+        if cache is None and cu_seqlens is not None:
+            # Packed training: block-diagonal (varlen) attention — each conversation
+            # only attends to itself. Flatten (b, T, H, D) -> (b*T, H, D).
+            H, D = queries.shape[2], queries.shape[3]
+            q_flat = queries.reshape(b * num_tokens, H, D)
+            k_flat = keys_new.reshape(b * num_tokens, keys_new.shape[2], D)
+            v_flat = values_new.reshape(b * num_tokens, values_new.shape[2], D)
+            context = flash_attn.flash_attn_varlen_func(q_flat, k_flat, v_flat, cu_seqlens, max_seqlen)
+            context = context.reshape(b, num_tokens, H, D)
+            next_cache = None
+        elif cache is None:
+            # Training: causal attention with FA3
             context = flash_attn.flash_attn_func(queries, keys_new, values_new, causal=True)
             next_cache = None
         else:
@@ -208,12 +224,13 @@ def l2norm(x, dim=-1, eps=1e-6):
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
 
-def fla_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False):
+def fla_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False, cu_seqlens=None):
     out, state = _fla_chunk_gated_delta_rule(
         query, key, value, g=g, beta=beta,
         initial_state=initial_state,
         output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        cu_seqlens=cu_seqlens,
     )
     return out, state
 
@@ -226,7 +243,12 @@ def fla_fused_recurrent_gated_delta_rule(query, key, value, g, beta, initial_sta
     )
     return out, state
 
-def torch_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False):
+def torch_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False, cu_seqlens=None):
+    assert cu_seqlens is None, (
+        "Packed/block-diagonal SFT requires FlashLinearAttention (fla) for cu_seqlens "
+        "support; the pure-PyTorch gated-delta-rule fallback cannot reset state at "
+        "segment boundaries. Install fla or disable --pretokenized."
+    )
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
@@ -365,7 +387,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj_b = Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = Linear(self.hidden_size, self.num_v_heads, bias=False)
 
-    def forward(self, hidden_states, mask=None, cos=None, sin=None, start_pos=0, cache=None):
+    def forward(self, hidden_states, mask=None, cos=None, sin=None, start_pos=0, cache=None, cu_seqlens=None, max_seqlen=None):
         batch_size, seq_len, _ = hidden_states.shape
         use_precomputed_states = (cache is not None and getattr(cache, 'has_previous_state', False) and seq_len == 1)
 
@@ -400,7 +422,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        if not use_precomputed_states:
+        if cu_seqlens is not None:
+            # Packed/block-diagonal: flatten (B, T, ...) -> (1, B*T, ...) and let FLA
+            # reset the recurrent state at each segment boundary via cu_seqlens. The
+            # depthwise conv1d above still mixes a few tokens across segment edges
+            # (accepted leak; conv kernel size is small).
+            q = query.reshape(1, batch_size * seq_len, *query.shape[2:])
+            k = key.reshape(1, batch_size * seq_len, *key.shape[2:])
+            v = value.reshape(1, batch_size * seq_len, *value.shape[2:])
+            g_f = g.reshape(1, batch_size * seq_len, *g.shape[2:])
+            beta_f = beta.reshape(1, batch_size * seq_len, *beta.shape[2:])
+            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                q, k, v, g=g_f, beta=beta_f, initial_state=None, output_final_state=False,
+                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens.to(torch.long),
+            )
+            core_attn_out = core_attn_out.reshape(batch_size, seq_len, *core_attn_out.shape[2:])
+        elif not use_precomputed_states:
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
                 query, key, value, g=g, beta=beta, initial_state=None, output_final_state=cache is not None, use_qk_l2norm_in_kernel=True
             )
@@ -434,11 +471,12 @@ class TransformerBlock(nn.Module):
         self.input_layernorm = RMSNorm(cfg.emb_dim, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.emb_dim, eps=cfg.rms_norm_eps)
 
-    def forward(self, x, mask, cos, sin, start_pos=0, cache=None):
+    def forward(self, x, mask, cos, sin, start_pos=0, cache=None, cu_seqlens=None, max_seqlen=None):
         shortcut = x
         x = self.input_layernorm(x)
         token_mixer = self.self_attn if self.layer_type == "full_attention" else self.linear_attn
-        x, next_cache = token_mixer(x, mask=mask, cos=cos, sin=sin, start_pos=start_pos, cache=cache)
+        x, next_cache = token_mixer(x, mask=mask, cos=cos, sin=sin, start_pos=start_pos, cache=cache,
+                                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = x + shortcut
 
         shortcut = x
@@ -633,21 +671,32 @@ class Qwen3_5Model(nn.Module):
                 if hasattr(m, 'A_log'):
                     torch.nn.init.normal_(m.A_log, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean',
+                cu_seqlens=None, position_ids=None):
         B, T = idx.size()
         T0 = 0 if kv_cache is None else getattr(kv_cache, 'pos', 0)
-        cos_sin = (self.cos[T0:T0+T], self.sin[T0:T0+T])
-        
+        if position_ids is not None:
+            # Packed/block-diagonal: per-token RoPE positions that reset per segment.
+            cos_sin = (self.cos[position_ids], self.sin[position_ids])
+        else:
+            cos_sin = (self.cos[T0:T0+T], self.sin[T0:T0+T])
+
+        # Longest segment length, needed by FA3 varlen (CPU sync; SFT runs uncompiled).
+        max_seqlen = None
+        if cu_seqlens is not None:
+            max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+
         x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
 
         for block in self.transformer.h:
             if self.use_gradient_checkpointing and self.training:
                 x, _ = gradient_checkpoint(
-                    block, x, None, cos_sin[0], cos_sin[1], T0, None,
+                    block, x, None, cos_sin[0], cos_sin[1], T0, None, cu_seqlens, max_seqlen,
                     use_reentrant=False,
                 )
             else:
-                x, _ = block(x, mask=None, cos=cos_sin[0], sin=cos_sin[1], start_pos=T0, cache=kv_cache)
+                x, _ = block(x, mask=None, cos=cos_sin[0], sin=cos_sin[1], start_pos=T0, cache=kv_cache,
+                             cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         
         x = self.final_norm(x)
         logits = self.lm_head(x)

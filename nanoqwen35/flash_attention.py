@@ -177,6 +177,50 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
 
 
+def flash_attn_varlen_func(q, k, v, cu_seqlens, max_seqlen):
+    """Block-diagonal causal attention for packed (variable-length) sequences.
+
+    Each segment (delimited by cu_seqlens) attends causally only to itself, so
+    conversations packed into the same row never attend across boundaries.
+
+    Args:
+        q, k, v: Tensors of shape (total_tokens, H, D) — the batch is flattened.
+        cu_seqlens: (num_seq + 1,) int32 cumulative segment boundaries (0 .. total_tokens).
+        max_seqlen: int, longest segment length.
+
+    Returns:
+        Output tensor of shape (total_tokens, H, D).
+    """
+    if USE_FA3:
+        return _fa3.flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            causal=True,
+        )
+
+    # SDPA fallback: build an explicit block-diagonal causal mask. O(total^2) memory,
+    # only used off-Hopper / on CPU (tests, small runs).
+    total = q.size(0)
+    device = q.device
+    cu = cu_seqlens.to(torch.long)
+    seg_id = torch.zeros(total, dtype=torch.long, device=device)
+    if cu.numel() > 2:
+        seg_id[cu[1:-1]] = 1
+    seg_id = torch.cumsum(seg_id, dim=0)                       # segment index per token
+    same_seg = seg_id.unsqueeze(1) == seg_id.unsqueeze(0)     # (total, total)
+    pos = torch.arange(total, device=device)
+    causal = pos.unsqueeze(1) >= pos.unsqueeze(0)
+    mask = same_seg & causal                                  # True = attend
+
+    q_ = q.transpose(0, 1).unsqueeze(0)                       # (1, H, total, D)
+    k_ = k.transpose(0, 1).unsqueeze(0)
+    v_ = v.transpose(0, 1).unsqueeze(0)
+    enable_gqa = q_.size(1) != k_.size(1)
+    y = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=mask, enable_gqa=enable_gqa)
+    return y.squeeze(0).transpose(0, 1)                       # (total, H, D)
+
+
 # =============================================================================
 # Export: flash_attn module interface (drop-in replacement for FA3)
 # =============================================================================
@@ -184,4 +228,5 @@ from types import SimpleNamespace
 flash_attn = SimpleNamespace(
     flash_attn_func=flash_attn_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
+    flash_attn_varlen_func=flash_attn_varlen_func,
 )

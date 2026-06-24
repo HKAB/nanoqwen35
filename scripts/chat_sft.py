@@ -28,7 +28,7 @@ inductor_config.fx_graph_cache = True
 from nanoqwen35.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanoqwen35.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanoqwen35.loss_eval import evaluate_loss
-from nanoqwen35.dataloader import sft_loader
+from nanoqwen35.dataloader import sft_loader, sft_pretokenized_loader
 import torch.distributed as dist
 from nanoqwen35.flash_attention import HAS_FA3
 from nanoqwen35.engine import Engine
@@ -49,6 +49,7 @@ parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start op
 parser.add_argument("--dataset-root", type=str, required=True, help="root folder whose subdirectories are domains; each domain contains parquet files with a 'messages' column")
 parser.add_argument("--buffer-size", type=int, default=128, help="per-domain conversation buffer size for best-fit packing")
 parser.add_argument("--mask-history", action="store_true", help="only supervise the last assistant turn (RL-style); default: supervise all assistant turns (SFT-style)")
+parser.add_argument("--pretokenized", action="store_true", help="dataset-root is an offline neat-packed SFT dataset (scripts/pretokenize.py --mode sft); uses block-diagonal attention")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, required=True, help="number of optimisation steps")
 # Batch sizes
@@ -117,6 +118,13 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
+if args.pretokenized and not args.no_compile:
+    print0("!" * 80)
+    print0("WARNING: --pretokenized uses per-batch-varying cu_seqlens for block-diagonal")
+    print0("attention, which is incompatible with torch.compile(dynamic=False). Forcing")
+    print0("--no-compile. (Revisit dynamic=True once training is confirmed working.)")
+    print0("!" * 80)
+    args.no_compile = True
 if args.no_compile:
     print0("torch.compile disabled (--no-compile flag set)")
 else:
@@ -185,23 +193,40 @@ def get_muon_momentum(step):
 
 # -----------------------------------------------------------------------------
 # Dataloaders
-mode_str = "RL (last-turn only)" if args.mask_history else "SFT (all assistant turns)"
-print0(f"Loading SFT dataloader — mode: {mode_str}")
-
-train_loader = sft_loader(
-    args.device_batch_size, args.max_seq_len, split="train",
-    dataset_root=args.dataset_root, tokenizer=tokenizer,
-    device=device, buffer_size=args.buffer_size, mask_history=args.mask_history,
-)
-build_val_loader = lambda: sft_loader(
-    args.device_batch_size, args.max_seq_len, split="val",
-    dataset_root=args.dataset_root, tokenizer=tokenizer,
-    device=device, buffer_size=args.buffer_size, mask_history=args.mask_history,
-)
+if args.pretokenized:
+    print0("Loading SFT dataloader — mode: pretokenized (offline neat-packed, block-diagonal)")
+    train_loader = sft_pretokenized_loader(
+        args.device_batch_size, args.max_seq_len, split="train",
+        dataset_root=args.dataset_root, device=device,
+    )
+    build_val_loader = lambda: sft_pretokenized_loader(
+        args.device_batch_size, args.max_seq_len, split="val",
+        dataset_root=args.dataset_root, device=device,
+    )
+else:
+    mode_str = "RL (last-turn only)" if args.mask_history else "SFT (all assistant turns)"
+    print0(f"Loading SFT dataloader — mode: {mode_str}")
+    train_loader = sft_loader(
+        args.device_batch_size, args.max_seq_len, split="train",
+        dataset_root=args.dataset_root, tokenizer=tokenizer,
+        device=device, buffer_size=args.buffer_size, mask_history=args.mask_history,
+    )
+    build_val_loader = lambda: sft_loader(
+        args.device_batch_size, args.max_seq_len, split="val",
+        dataset_root=args.dataset_root, tokenizer=tokenizer,
+        device=device, buffer_size=args.buffer_size, mask_history=args.mask_history,
+    )
 
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader)
+def unpack_batch(batch):
+    """sft_loader yields (x, y); sft_pretokenized_loader yields (x, y, cu_seqlens, position_ids)."""
+    if len(batch) == 4:
+        return batch
+    x, y = batch
+    return x, y, None, None
+
+x, y, cu_seqlens, position_ids = unpack_batch(next(train_loader))
 min_val_loss    = float("inf")
 smooth_loss     = 0.0
 ema_beta        = 0.9
@@ -259,14 +284,14 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, cu_seqlens=cu_seqlens, position_ids=position_ids)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y = next(train_loader)
+        x, y, cu_seqlens, position_ids = unpack_batch(next(train_loader))
 
     lrm            = get_lr_multiplier(step)
     muon_momentum  = get_muon_momentum(step)

@@ -14,8 +14,16 @@ def evaluate_loss(model, batches, steps):
     total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
-        x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
+        batch = next(batch_iter)
+        # pretrain/sft loaders yield (x, y); the pretokenized-SFT loader additionally
+        # yields (cu_seqlens, position_ids) for block-diagonal attention.
+        if len(batch) == 4:
+            x, y, cu_seqlens, position_ids = batch
+        else:
+            x, y = batch
+            cu_seqlens = position_ids = None
+        loss2d = model(x, y, loss_reduction='none',
+                       cu_seqlens=cu_seqlens, position_ids=position_ids)  # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
         

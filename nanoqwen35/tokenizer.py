@@ -78,17 +78,25 @@ class HuggingFaceTokenizer:
         self.tokenizer.save(tokenizer_path)
         print(f"Saved tokenizer to {tokenizer_path}")
 
-    def render_conversation(self, conversation, max_tokens=2048, mask_history=False):
+    def render_conversation(self, conversation, max_tokens=2048, mask_history=False,
+                            return_boundaries=False):
         """
         Render a conversation dict into token ids and loss mask.
 
         mask_history=False (default): all assistant turns are supervised (mask=1).
         mask_history=True: only the last assistant turn (after the last real user query)
             is supervised — useful when only the final response is the training target.
+
+        return_boundaries=True: additionally return a list of token offsets marking the
+            start of each user turn. These are the natural cut points for "smart chunking"
+            long conversations (split between complete user→assistant exchanges). The
+            leading system header (before the first user turn) belongs to the first piece,
+            so callers should only cut at boundaries[1:].
         """
         import json
 
         ids, mask = [], []
+        boundaries = []  # token offsets at the start of each user turn
 
         def add_tokens(token_ids, mask_val):
             if isinstance(token_ids, int):
@@ -174,6 +182,7 @@ class HuggingFaceTokenizer:
                 raise ValueError("System message must be at the beginning.")
 
             elif role == "user":
+                boundaries.append(len(ids))  # cut point: start of a user turn
                 add_tokens(im_start, 0)
                 add_tokens(self.encode("user\n"), 0)
                 add_tokens(self.encode(content), 0)
@@ -247,6 +256,9 @@ class HuggingFaceTokenizer:
 
         ids = ids[:max_tokens]
         mask = mask[:max_tokens]
+        if return_boundaries:
+            boundaries = [b for b in boundaries if b < len(ids)]
+            return ids, mask, boundaries
         return ids, mask
 
     def render_for_completion(self, conversation, enable_thinking=True):
