@@ -404,23 +404,6 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
-# -----------------------------------------------------------------------------
-# Pre-training kernel warmup
-# FLA/tilelang JIT kernels are compiled lazily on first use and can take >10 min.
-# Running a forward+backward warmup on all ranks before any NCCL collective is
-# launched prevents NCCL timeout from hitting the default 10-minute limit.
-if ddp and device_type == "cuda":
-    print0("Pre-training warmup: compiling kernels on all ranks (forward + backward)...")
-    model.train()
-    _wx = torch.zeros((args.device_batch_size, args.max_seq_len), dtype=torch.long, device=device)
-    _wy = torch.zeros((args.device_batch_size, args.max_seq_len), dtype=torch.long, device=device)
-    _wl = model(_wx, _wy)   # compile forward (and torch.compile graph)
-    _wl.backward()          # compile backward (triggers FLA chunk_bwd/tilelang kernels)
-    model.zero_grad(set_to_none=True)
-    del _wx, _wy, _wl
-    dist.barrier()  # wait for ALL ranks to finish compilation before any NCCL collective
-    print0("Kernel warmup complete — all ranks synchronized.")
-
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
