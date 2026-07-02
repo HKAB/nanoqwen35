@@ -16,7 +16,7 @@ from nanoqwen35.common import compute_init, compute_cleanup, get_dist_info, prin
 from nanoqwen35.checkpoint_manager import load_model
 from nanoqwen35.engine import Engine
 
-from tasks.sample_eval import SampleMC
+from tasks.global_mmlu import GlobalMMLU
 
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
@@ -153,7 +153,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
                    max_problems=None):
     task_registry = {
-        'SampleMC': SampleMC,
+        'GlobalMMLU': GlobalMMLU('./.cache/nanoqwen35/eval_bundle/eval_data/global_mmlu.jsonl'),
     }
     if task_name not in task_registry:
         raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_registry)}")
@@ -191,9 +191,9 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
-    all_tasks = ['SampleMC']
+    all_tasks = ['GlobalMMLU']  # Add more tasks here as they are implemented
     baseline_accuracies = {
-        'SampleMC': 0.25, # multiple choice 1 of 4 => 25%
+        'GlobalMMLU': 0.25, # multiple choice 1 of 4 => 25%
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 

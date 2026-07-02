@@ -32,7 +32,7 @@ from nanoqwen35.dataloader import sft_loader, sft_pretokenized_loader
 import torch.distributed as dist
 from nanoqwen35.flash_attention import HAS_FA3
 from nanoqwen35.engine import Engine
-from tasks.sample_eval import run_sample_mc_eval
+from scripts.chat_eval import run_chat_eval
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -130,7 +130,8 @@ if args.no_compile:
 else:
     model = torch.compile(model, dynamic=False)
 model_config_kwargs = meta.get("model_config", {})
-num_flops_per_token = model.estimate_flops()
+_flops_global_batch = args.device_batch_size * ddp_world_size
+num_flops_per_token = model.estimate_flops(_flops_global_batch, args.max_seq_len) / (_flops_global_batch * args.max_seq_len)
 
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size
@@ -236,6 +237,12 @@ step = 0
 while True:
     last_step = (step == args.num_iterations)
 
+    # Synchronize last_step across all ranks to avoid hangs in distributed training
+    if ddp:
+        last_step_tensor = torch.tensor(last_step, dtype=torch.int32, device=device)
+        dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
+        last_step = bool(last_step_tensor.item())
+
     # Validation loss
     if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
         model.eval()
@@ -253,10 +260,28 @@ while True:
     if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
         model.eval()
         engine = Engine(orig_model, tokenizer)
-        mc_acc = run_sample_mc_eval(orig_model, tokenizer, engine)
-        chatcore = (mc_acc - 0.25) / (1.0 - 0.25)
-        print0(f"Step {step:05d} | SampleMC: {100*mc_acc:.2f}% | ChatCORE: {chatcore:.4f}")
-        wandb_run.log({"step": step, "chatcore_metric": chatcore, "chatcore/SampleMC": mc_acc})
+        
+        categorical_tasks = ["GlobalMMLU"]
+        baseline_accuracies = {
+            'GlobalMMLU': 0.25,  # Random baseline
+        }
+        task_results = {}
+        for task_name in categorical_tasks:
+            acc = run_chat_eval(task_name, model, tokenizer, engine, batch_size=args.device_batch_size)
+            task_results[task_name] = acc
+            print0(f"Step {step:05d} | ChatCORE {task_name}: {100*acc:.2f}%")
+        
+        def centered_mean(tasks):
+            return sum((task_results[t] - baseline_accuracies[t]) / (1.0 - baseline_accuracies[t]) for t in tasks) / len(tasks)
+
+        chatcore_cat = centered_mean(categorical_tasks)
+
+        print0(f"Step {step:05d} | ChatCORE_cat: {chatcore_cat:.4f}")
+        wandb_run.log({
+            "step": step,
+            "chatcore_cat": chatcore_cat,
+            **{f"chatcore_{t}": task_results[t] for t in categorical_tasks},
+        })
         model.train()
 
     # Save checkpoint
