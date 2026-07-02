@@ -182,7 +182,7 @@ def pretrain_loader(*args, **kwargs):
 # SFT / RL dataloader (best-fit knapsack, online tokenization)
 # ---------------------------------------------------------------------------
 
-def _sft_conv_iter(split, parquet_files, tokenizer, max_tokens):
+def _sft_conv_iter(split, parquet_files, tokenizer, max_tokens, mask_history=False):
     """
     Infinite iterator over (token_ids, loss_mask) pairs from a parquet domain.
 
@@ -214,7 +214,11 @@ def _sft_conv_iter(split, parquet_files, tokenizer, max_tokens):
                     if isinstance(msgs, (str, bytes)):
                         msgs = _json.loads(msgs)
                     conversation = {"messages": msgs}
-                    ids, mask = tokenizer.render_conversation(conversation, max_tokens=max_tokens)
+                    ids, mask = tokenizer.render_conversation(
+                        conversation,
+                        max_tokens=max_tokens,
+                        mask_history=mask_history,
+                    )
                     if ids:
                         yield list(ids), list(mask)
 
@@ -264,7 +268,13 @@ def sft_loader(
     # conversation fits in T slots, guaranteeing at least one conv per row.
     _max_tok = T if not mask_history else T
     domain_iters   = {
-        d: _sft_conv_iter(split, domain_file_map[d], tokenizer, _max_tok)
+        d: _sft_conv_iter(
+            split,
+            domain_file_map[d],
+            tokenizer,
+            _max_tok,
+            mask_history=mask_history,
+        )
         for d in domains
     }
     domain_buffers = {d: [] for d in domains}
